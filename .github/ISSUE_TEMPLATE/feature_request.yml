@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest an idea or enhancement for metaText
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checklist
+      options:
+        - label: I searched existing issues and discussions for this idea.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature request related to a problem?
+      description: A clear and concise description of the problem, e.g. "I'm always frustrated when ...".
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Describe alternatives you've considered
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mockups, references, related projects, etc.
+    validations:
+      required: false

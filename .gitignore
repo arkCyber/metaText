@@ -1,0 +1,34 @@
+# =============================================================================
+# metaText .gitignore
+# =============================================================================
+
+# ---- Rust / Cargo build artifacts ------------------------------------------
+/target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+
+# ---- metaText runtime data -------------------------------------------------
+# Session snapshot, SQLite databases, logs and other per-user state.
+metatext-session.json
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+logs/
+*.log
+
+# ---- Environment / secrets -------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+
+# ---- Editor and OS noise ---------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

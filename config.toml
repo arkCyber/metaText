@@ -1,0 +1,49 @@
+[app]
+name = 'metaText'
+version = '0.4.0'
+default_nickname = 'metaText00'
+default_status = 'Keep on Metaverse .......'
+max_friends = 1024
+max_message_length = 1372
+auto_save_interval = 300
+
+[network]
+port = 33445
+bootstrap_nodes = [
+    'tox.abilinski.com:33445',
+    'tox.abilinski.com:3389',
+    'tox.instinctive.ch:33445',
+    'tox.instinctive.ch:3389',
+]
+connection_timeout = 30
+max_connections = 100
+enable_upnp = true
+enable_ipv6 = true
+
+[database]
+database_type = 'sqlite'
+connection_string = 'meta_text.db'
+max_connections = 10
+enable_migrations = true
+
+[crypto]
+enable_encryption = true
+algorithm = 'ChaCha20-Poly1305'
+kdf = 'Argon2'
+key_rotation_days = 30
+enable_pfs = true
+
+[ui]
+theme = 'dark'
+enable_colors = true
+enable_mouse = true
+message_format = '[{time}] {sender}: {message}'
+auto_scroll = true
+
+[logging]
+level = 'info'
+file_path = 'logs/meta-text.log'
+enable_console = true
+enable_file = true
+rotation_size_mb = 10
+max_files = 5

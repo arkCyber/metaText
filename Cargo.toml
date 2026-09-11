@@ -1,0 +1,78 @@
+[package]
+name = "meta-text"
+version = "0.4.0"
+edition = "2021"
+authors = ["arkSong <arksong2018@gmail.com>"]
+description = "A Web3 decentralized instant messaging client built with Rust"
+license = "MIT"
+repository = "https://github.com/arksong/meta-text-rust"
+homepage = "https://github.com/arksong/meta-text-rust"
+documentation = "https://docs.rs/meta-text"
+readme = "README.md"
+keywords = ["web3", "messaging", "decentralized", "tox", "p2p"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.5"
+
+# CLI argument parsing
+clap = { version = "4.0", features = ["derive", "env"] }
+
+# Database
+# Database drivers are opt-in through the crate features below; the default
+# build only enables SQLite (see [features]). Enabling postgres/mysql here would
+# force all three drivers to be compiled unconditionally.
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls"], optional = true }
+
+# Cryptography
+argon2 = "0.5"
+rand = "0.8"
+chacha20poly1305 = "0.10"
+
+# Network and Tox protocol
+tox = { version = "0.1.1", optional = true }
+
+# Terminal UI
+crossterm = { version = "0.27", optional = true }
+tui = { version = "0.19", optional = true }
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+dirs = "5.0"
+
+tempfile = "3.8"
+
+# NOTE: `criterion` was previously declared here but there are no benchmark
+# targets under `benches/`, and it pulled `is-terminal` which cannot be fetched
+# in an offline build. Re-add it together with a benchmark if needed.
+
+[features]
+# Database drivers are opt-in: the default build stays light and does not
+# compile SQLx. Enable e.g. `--features sqlite` when persistence is needed.
+default = []
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+mysql = ["sqlx/mysql"]
+tox-protocol = ["tox"]
+terminal-ui = ["crossterm", "tui"]
+
+# Make this package its own workspace root so the directory can be published as
+# a standalone repository (independent of any enclosing workspace).
+[workspace]

@@ -1,0 +1,26 @@
+# Normalize line endings in the repository to LF and let Git convert them on
+# checkout according to the platform. See https://git-scm.com/docs/gitattributes
+* text=auto eol=lf
+
+# Rust sources are always LF.
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+Makefile text eol=lf
+
+# Windows batch files keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+
+# Collapse generated files in diffs and language stats.
+Cargo.lock -diff linguist-generated=true

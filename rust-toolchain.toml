@@ -1,0 +1,8 @@
+[toolchain]
+# The crate targets the stable channel and is tested on the latest stable
+# release of Rust in CI. Pinning the channel keeps local builds, `rustfmt` and
+# `clippy` consistent with the pipeline.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = []
+profile = "default"

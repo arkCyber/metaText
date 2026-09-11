@@ -1,0 +1,266 @@
+# =============================================================================
+# Cursor AI Rules for Rust Chat Project
+# =============================================================================
+# Project: metaText - Web3 Instant Message Client
+# Author: arkSong <arksong2018@gmail.com>
+# Language: Rust
+# Version: 0.4.0
+# Created: 2024-01-15
+# =============================================================================
+
+[project]
+name = "meta-text-rust"
+language = "rust"
+author = "arkSong <arksong2018@gmail.com>"
+description = "A Web3 decentralized instant messaging client built with Rust"
+license = "MIT"
+
+[coding_standards]
+# All code must be written in English
+language = "english"
+comment_language = "english"
+documentation_language = "english"
+
+# Code formatting and style
+format_on_save = true
+use_rustfmt = true
+use_clippy = true
+max_line_length = 100
+
+# Error handling
+use_result_type = true
+use_anyhow_for_errors = true
+propagate_errors_explicitly = true
+
+[documentation]
+# Comprehensive documentation requirements
+require_module_docs = true
+require_function_docs = true
+require_struct_docs = true
+require_enum_docs = true
+require_trait_docs = true
+require_public_api_docs = true
+
+# Documentation style
+doc_comment_style = "///"
+inline_comment_style = "//"
+todo_comment_format = "TODO(arkSong): "
+fixme_comment_format = "FIXME(arkSong): "
+
+[commenting_rules]
+# Detailed commenting requirements
+require_file_header = true
+require_function_comments = true
+require_complex_logic_comments = true
+require_error_handling_comments = true
+require_performance_critical_comments = true
+
+# Comment templates
+file_header_template = """
+/*!
+ * {filename}
+ * 
+ * {description}
+ * 
+ * Author: arkSong <arksong2018@gmail.com>
+ * Created: {date}
+ * Version: {version}
+ * License: MIT
+ * 
+ * Features:
+ * - {feature_list}
+ */
+"""
+
+function_comment_template = """
+/// {brief_description}
+/// 
+/// # Arguments
+/// 
+/// * `{param_name}` - {param_description}
+/// 
+/// # Returns
+/// 
+/// {return_description}
+/// 
+/// # Errors
+/// 
+/// {error_description}
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// {example_code}
+/// ```
+"""
+
+[testing]
+# Comprehensive testing requirements
+require_unit_tests = true
+require_integration_tests = true
+require_doc_tests = true
+require_benchmark_tests = true
+
+# Test coverage
+minimum_coverage = 80
+test_naming_convention = "test_{function_name}_{scenario}"
+benchmark_naming_convention = "bench_{function_name}"
+
+# Test organization
+test_module_suffix = "_tests"
+integration_test_dir = "tests/"
+benchmark_test_dir = "benches/"
+
+[logging]
+# Logging requirements
+require_structured_logging = true
+log_level_development = "debug"
+log_level_production = "info"
+use_tracing = true
+use_log_timestamps = true
+
+# Log message format
+log_format = "{timestamp} [{level}] [{target}] {message}"
+timestamp_format = "%Y-%m-%d %H:%M:%S%.3f"
+
+# Logging guidelines
+log_function_entry = true
+log_function_exit = true
+log_error_details = true
+log_performance_metrics = true
+
+[dependencies]
+# Preferred crates for different purposes
+async_runtime = "tokio"
+error_handling = "anyhow"
+logging = "tracing"
+serialization = "serde"
+networking = "tox"
+testing = "tokio-test"
+benchmarking = "criterion"
+
+[code_patterns]
+# Preferred Rust patterns
+use_builder_pattern = true
+use_newtype_pattern = true
+use_state_machine_pattern = true
+prefer_composition_over_inheritance = true
+
+# Error handling patterns
+use_result_for_fallible_operations = true
+use_option_for_optional_values = true
+chain_result_operations = true
+
+# Async patterns
+use_async_await = true
+use_tokio_spawn_for_tasks = true
+use_channels_for_communication = true
+
+[security]
+# Security best practices
+validate_all_inputs = true
+sanitize_user_data = true
+use_secure_random = true
+implement_rate_limiting = true
+log_security_events = true
+
+# Crypto requirements
+use_constant_time_comparison = true
+secure_memory_handling = true
+validate_crypto_operations = true
+
+[performance]
+# Performance guidelines
+profile_critical_paths = true
+use_zero_copy_where_possible = true
+minimize_allocations = true
+use_efficient_data_structures = true
+benchmark_performance_critical_code = true
+
+[git_workflow]
+# Git commit message format
+commit_message_format = "{type}({scope}): {description}"
+commit_types = ["feat", "fix", "docs", "style", "refactor", "test", "perf", "chore"]
+
+# Branch naming
+branch_naming_format = "{type}/{description}"
+feature_branch_prefix = "feat/"
+bugfix_branch_prefix = "fix/"
+hotfix_branch_prefix = "hotfix/"
+
+[ai_assistant_instructions]
+# Instructions for AI coding assistant
+always_add_detailed_comments = true
+always_include_error_handling = true
+always_add_logging_statements = true
+always_write_tests = true
+always_use_english = true
+
+# Code generation preferences
+prefer_explicit_over_implicit = true
+prefer_readable_over_clever = true
+prefer_safe_over_fast = true
+explain_complex_algorithms = true
+
+# Review checklist
+check_memory_safety = true
+check_thread_safety = true
+check_error_propagation = true
+check_test_coverage = true
+check_documentation_completeness = true
+
+[project_structure]
+# Directory structure
+src_dir = "src/"
+test_dir = "tests/"
+bench_dir = "benches/"
+doc_dir = "docs/"
+example_dir = "examples/"
+
+# File naming conventions
+module_files = "snake_case"
+test_files = "snake_case_test"
+benchmark_files = "snake_case_bench"
+
+[specific_requirements]
+# Chat application specific requirements
+implement_message_encryption = true
+implement_user_authentication = true
+implement_message_persistence = true
+implement_real_time_communication = true
+implement_group_chat = true
+implement_file_transfer = true
+
+# Web3 specific requirements
+implement_decentralized_identity = true
+implement_blockchain_integration = true
+implement_peer_to_peer_networking = true
+implement_cryptographic_signatures = true
+
+[code_review_checklist]
+# Pre-commit checklist
+- "All functions have detailed documentation"
+- "All public APIs have examples"
+- "Error handling is comprehensive"
+- "Logging is properly implemented"
+- "Unit tests are written and passing"
+- "Integration tests cover main workflows"
+- "Code follows Rust best practices"
+- "Security considerations are addressed"
+- "Performance implications are considered"
+- "Memory safety is ensured"
+
+[automation]
+# Automated checks
+run_clippy_on_save = true
+run_tests_on_save = true
+format_code_on_save = true
+check_spelling = true
+validate_documentation = true
+
+# CI/CD requirements
+require_all_tests_pass = true
+require_clippy_clean = true
+require_rustfmt_clean = true
+require_doc_tests_pass = true
+minimum_code_coverage = 80 
