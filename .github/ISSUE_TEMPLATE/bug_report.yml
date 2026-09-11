@@ -8,7 +8,7 @@ body:
       value: |
         Thanks for taking the time to file a bug! Please fill in as much detail
         as you can. For security issues, do **not** use this form — see
-        [SECURITY.md](https://github.com/arksong/meta-text-rust/blob/main/SECURITY.md).
+        [SECURITY.md](https://github.com/arkCyber/metaText/blob/main/SECURITY.md).
   - type: checkboxes
     id: preflight
     attributes:

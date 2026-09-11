@@ -10,7 +10,7 @@ CARGO ?= cargo
 FEATURES ?= sqlite,terminal-ui
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run run-tui run-cli test test-all fmt fmt-check clippy \
+.PHONY: help build release run run-tui run-cli run-core test test-all fmt fmt-check clippy \
         lint doc doc-open check ci clean
 
 help: ## Show this help message
@@ -32,6 +32,9 @@ run-tui: ## Run the full screen terminal interface
 
 run-cli: ## Run the scriptable command line interface
 	$(CARGO) run --features $(FEATURES) -- --mode cli
+
+run-core: ## Run the headless core service (no user interface)
+	$(CARGO) run --features $(FEATURES) -- --mode core
 
 test: ## Run the default test suite
 	$(CARGO) test

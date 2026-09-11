@@ -53,16 +53,20 @@ pub struct CliArgs {
     )]
     pub mode: AppMode,
 
-    /// Log level
+    /// Log level explicitly requested on the command line
+    ///
+    /// Left unset by default so "no preference" can be told apart from an
+    /// explicit request; an explicit value overrides `[logging] level` in the
+    /// configuration file. Use [`CliArgs::effective_log_level`] for the
+    /// resolved value.
     #[arg(
         short = 'l',
         long = "log-level",
         value_enum,
-        default_value_t = LogLevel::Info,
         global = true,
-        help = "Set the logging level"
+        help = "Set the logging level (overrides [logging] level)"
     )]
-    pub log_level: LogLevel,
+    pub log_level: Option<LogLevel>,
 
     /// Run in headless mode (no TUI)
     #[arg(
@@ -167,6 +171,25 @@ pub struct CliArgs {
     )]
     pub nickname: Option<String>,
 
+    /// Address to expose the core protocol on (headless modes)
+    #[arg(
+        long = "ipc-listen",
+        value_name = "ADDRESS",
+        global = true,
+        help = "Host:port to serve the core protocol on; omit to stay private"
+    )]
+    pub ipc_listen: Option<String>,
+
+    /// Shared secret required by protocol clients
+    #[arg(
+        long = "ipc-token",
+        value_name = "TOKEN",
+        env = "METATEXT_IPC_TOKEN",
+        global = true,
+        help = "Token a protocol client must present on --ipc-listen"
+    )]
+    pub ipc_token: Option<String>,
+
     /// Optional top level subcommand
     ///
     /// When omitted the [`CliArgs::mode`] flag selects the interface. `run` is
@@ -200,6 +223,9 @@ pub enum AppMode {
 
     /// Daemon mode for system service
     Daemon,
+
+    /// Headless core service only (no user interface attached)
+    Core,
 }
 
 /// Logging levels
@@ -222,6 +248,37 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
+    /// Parse a log level from its lower case name.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Candidate level name, matched case-insensitively.
+    ///
+    /// # Returns
+    ///
+    /// Returns the matching level, or `None` for an unknown name.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use meta_text::cli::LogLevel;
+    ///
+    /// assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
+    /// assert_eq!(LogLevel::parse("DEBUG"), Some(LogLevel::Debug));
+    /// assert_eq!(LogLevel::parse("verbose"), None);
+    /// ```
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "error" => Some(Self::Error),
+            "warn" | "warning" => Some(Self::Warn),
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            "trace" => Some(Self::Trace),
+            _ => None,
+        }
+    }
+
     /// Get the stable filter directive for this log level
     ///
     /// The returned value is lower case and can be fed directly to
@@ -254,6 +311,10 @@ impl LogLevel {
 impl CliArgs {
     /// Get the effective log level considering debug flag
     ///
+    /// The returned value is the level to fall back to when neither `RUST_LOG`
+    /// nor an explicit `--log-level` is available; it defaults to
+    /// [`LogLevel::Info`] and becomes [`LogLevel::Debug`] when `--debug` is set.
+    ///
     /// # Returns
     ///
     /// Returns the effective log level, which will be Debug if the debug flag
@@ -267,10 +328,43 @@ impl CliArgs {
     ///
     /// let args = CliArgs::parse_from(["meta-text", "--debug"]);
     /// assert_eq!(args.effective_log_level(), LogLevel::Debug);
+    ///
+    /// let args = CliArgs::parse_from(["meta-text"]);
+    /// assert_eq!(args.effective_log_level(), LogLevel::Info);
     /// ```
+    #[must_use]
     pub fn effective_log_level(&self) -> LogLevel {
+        self.log_level_override().unwrap_or(LogLevel::Info)
+    }
+
+    /// The log level the user asked for on the command line, if any
+    ///
+    /// This is what lets an explicit `--log-level` (or `--debug`) override the
+    /// `[logging] level` value in the configuration file instead of being
+    /// shadowed by it. `--debug` is treated as an explicit request for
+    /// [`LogLevel::Debug`] and wins over `--log-level`.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(level)` when the command line expressed a preference, or
+    /// `None` when the configuration file should decide.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use clap::Parser;
+    /// use meta_text::cli::{CliArgs, LogLevel};
+    ///
+    /// let args = CliArgs::parse_from(["meta-text"]);
+    /// assert_eq!(args.log_level_override(), None);
+    ///
+    /// let args = CliArgs::parse_from(["meta-text", "--log-level", "warn"]);
+    /// assert_eq!(args.log_level_override(), Some(LogLevel::Warn));
+    /// ```
+    #[must_use]
+    pub const fn log_level_override(&self) -> Option<LogLevel> {
         if self.debug {
-            LogLevel::Debug
+            Some(LogLevel::Debug)
         } else {
             self.log_level
         }
@@ -368,9 +462,7 @@ impl CliArgs {
     /// Returns `true` when the address has a non-empty host and a valid port.
     #[must_use]
     pub fn is_valid_peer_address(address: &str) -> bool {
-        address.rsplit_once(':').is_some_and(|(host, port)| {
-            !host.is_empty() && port.parse::<u16>().is_ok_and(|value| value > 0)
-        })
+        crate::utils::is_valid_host_port(address)
     }
 
     /// Validate command line arguments
@@ -449,7 +541,7 @@ impl Default for CliArgs {
         Self {
             config_path: PathBuf::from("config.toml"),
             mode: AppMode::Tui,
-            log_level: LogLevel::Info,
+            log_level: None,
             headless: false,
             data_dir: None,
             port: None,
@@ -461,6 +553,8 @@ impl Default for CliArgs {
             peers: Vec::new(),
             passphrase: None,
             nickname: None,
+            ipc_listen: None,
+            ipc_token: None,
             command: None,
         }
     }
@@ -473,6 +567,7 @@ impl std::fmt::Display for AppMode {
             AppMode::Cli => write!(f, "CLI"),
             AppMode::Server => write!(f, "Server"),
             AppMode::Daemon => write!(f, "Daemon"),
+            AppMode::Core => write!(f, "Core"),
         }
     }
 }
@@ -499,7 +594,7 @@ mod tests {
 
         assert_eq!(args.config_path, PathBuf::from("config.toml"));
         assert_eq!(args.mode, AppMode::Tui);
-        assert_eq!(args.log_level, LogLevel::Info);
+        assert_eq!(args.log_level, None);
         assert!(!args.headless);
         assert!(!args.debug);
         assert!(args.encryption_enabled());
@@ -518,6 +613,20 @@ mod tests {
         // With debug flag
         args.debug = true;
         assert_eq!(args.effective_log_level(), LogLevel::Debug);
+    }
+
+    /// An explicit `--log-level` is reported as an override; `--debug` wins.
+    #[test]
+    fn test_log_level_override() {
+        assert_eq!(CliArgs::default().log_level_override(), None);
+
+        let args = CliArgs::parse_from(["meta-text", "--log-level", "warn"]);
+        assert_eq!(args.log_level_override(), Some(LogLevel::Warn));
+        assert_eq!(args.effective_log_level(), LogLevel::Warn);
+
+        // `--debug` is the stronger request even next to `--log-level`.
+        let args = CliArgs::parse_from(["meta-text", "--log-level", "error", "--debug"]);
+        assert_eq!(args.log_level_override(), Some(LogLevel::Debug));
     }
 
     #[test]
@@ -601,8 +710,14 @@ mod tests {
         assert_eq!(args.nickname.as_deref(), Some("Alice"));
         assert_eq!(args.peers, vec!["127.0.0.1:34568".to_string()]);
         // Unrelated defaults are preserved through the subcommand.
-        assert_eq!(args.log_level, LogLevel::Info);
+        assert_eq!(args.log_level, None);
+        assert_eq!(args.effective_log_level(), LogLevel::Info);
         assert_eq!(args.command, Some(CliCommand::Run));
+
+        // A log level given *after* `run` is still parsed as a global option.
+        let args = CliArgs::parse_from(["meta-text", "run", "--log-level", "warn"]);
+        assert_eq!(args.log_level, Some(LogLevel::Warn));
+        assert_eq!(args.effective_log_level(), LogLevel::Warn);
     }
 
     /// Without a subcommand `--mode` keeps deciding the interface

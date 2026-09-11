@@ -21,14 +21,16 @@
  * into small, focused modules so that each subsystem can be tested and reused
  * independently:
  *
- * - [`app`]: top level application coordinator
+ * - [`ipc`]: the versioned interface between the user interfaces and the core
+ * - [`ipc::core`]: the headless backend service that owns all domain state
+ * - [`ui`]: the CLI and TUI front-ends (presentation only)
  * - [`cli`]: command line argument parsing
  * - [`commands`]: interactive slash command parsing
  * - [`config`]: TOML based configuration management
  * - [`crypto`]: authenticated encryption and key derivation
  * - [`database`]: SQLite persistence for contacts and messages
  * - [`network`]: peer to peer TCP transport
- * - [`tui`]: full screen terminal interface and console output routing
+ * - [`tui`]: terminal rendering engine and console output routing
  * - [`types`]: shared domain types
  * - [`utils`]: small helper functions
  *
@@ -55,22 +57,24 @@
     rust_2018_idioms
 )]
 
-pub mod app;
 pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod crypto;
 pub mod database;
 pub mod error;
+pub mod ipc;
 pub mod network;
 pub mod tui;
 pub mod types;
+pub mod ui;
 pub mod utils;
 
-pub use app::MetaTextApp;
 pub use cli::{AppMode, CliArgs, LogLevel};
 pub use config::AppConfig;
 pub use error::{MetaTextError, MetaTextResult};
+pub use ipc::{CoreHandle, CoreService};
+pub use ui::{CliFrontend, Presenter, TuiFrontend};
 
 /// Current version of the metaText library
 ///

@@ -22,8 +22,8 @@ By participating in this project you agree to abide by our
 ## Getting started
 
 ```bash
-git clone https://github.com/arksong/meta-text-rust.git
-cd meta-text-rust
+git clone https://github.com/arkCyber/metaText.git
+cd metaText
 
 # Format, lint and test everything the way CI does
 cargo fmt --all -- --check

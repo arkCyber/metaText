@@ -18,9 +18,9 @@ use meta_text::cli::CliArgs;
 use meta_text::config::{AppConfig, CryptoConfig, DatabaseConfig, NetworkConfig};
 use meta_text::crypto::{CryptoManager, KEY_LENGTH};
 use meta_text::database::DatabaseManager;
+use meta_text::ipc::{CoreClient, CoreService, Request};
 use meta_text::network::NetworkManager;
 use meta_text::types::AppState;
-use meta_text::MetaTextApp;
 
 /// A configuration with a loopback network port and a temporary database file
 fn test_config(db_path: &std::path::Path) -> AppConfig {
@@ -73,7 +73,7 @@ async fn test_network_lifecycle() {
     };
 
     let crypto = Arc::new(CryptoManager::new(&CryptoConfig::default()).await.unwrap());
-    let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(1024);
     let mut manager = NetworkManager::new(&config, crypto, event_sender)
         .await
         .unwrap();
@@ -107,7 +107,7 @@ async fn test_peers_exchange_messages_end_to_end() {
     let (mut alice, mut alice_events) = {
         let crypto =
             Arc::new(Crypto::from_passphrase(&CryptoConfig::default(), passphrase).unwrap());
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1024);
         (
             NetworkManager::new(&config, crypto, sender).await.unwrap(),
             receiver,
@@ -116,7 +116,7 @@ async fn test_peers_exchange_messages_end_to_end() {
     let (mut bob, _bob_events) = {
         let crypto =
             Arc::new(Crypto::from_passphrase(&CryptoConfig::default(), passphrase).unwrap());
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(1024);
         (
             NetworkManager::new(&config, crypto, sender).await.unwrap(),
             receiver,
@@ -217,15 +217,65 @@ async fn test_sqlite_history_survives_restart() {
     }
 }
 
-/// The application coordinator initializes with a valid configuration
+/// The core service initializes and answers requests over the private channel
 #[tokio::test]
-async fn test_app_initialization_end_to_end() {
+async fn test_core_service_initialization_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(&dir.path().join("meta-text.db"));
     let args = CliArgs::default();
 
-    let app = MetaTextApp::new(config, args).await;
-    assert!(app.is_ok());
+    let service = CoreService::new(config, args).await;
+    assert!(service.is_ok(), "the core service must initialise");
+
+    // A freshly built service can already answer pure data requests; starting
+    // the sockets is a separate, explicit step.
+    let mut service = service.unwrap();
+    service.start().await.expect("start");
+    let handle = service.spawn();
+    let client = meta_text::ipc::LocalClient::new(handle.clone());
+
+    // The read-only requests must answer without touching the network.
+    let reply = client
+        .request(Request::Ping {
+            echo: Some("integration".to_string()),
+        })
+        .await
+        .expect("ping");
+    assert_eq!(
+        reply,
+        meta_text::ipc::Reply::Pong {
+            echo: Some("integration".to_string())
+        }
+    );
+
+    let contacts = client
+        .request(Request::ListContacts)
+        .await
+        .expect("contacts");
+    assert!(matches!(
+        contacts,
+        meta_text::ipc::Reply::Contacts { contacts } if contacts.is_empty()
+    ));
+
+    // Mutations are visible through subsequent reads.
+    client
+        .request(Request::AddContact {
+            identifier: "DID-INTEGRATION".to_string(),
+            note: None,
+        })
+        .await
+        .expect("add");
+    let contacts = client
+        .request(Request::ListContacts)
+        .await
+        .expect("contacts");
+    assert!(matches!(
+        contacts,
+        meta_text::ipc::Reply::Contacts { contacts }
+            if contacts.len() == 1 && contacts[0].name == "DID-INTEGRATION"
+    ));
+
+    handle.shutdown().await.expect("shutdown");
 }
 
 /// Application state starts with sensible defaults

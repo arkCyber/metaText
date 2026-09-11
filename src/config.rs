@@ -21,6 +21,27 @@ use tracing::{info, warn};
 
 use crate::error::{MetaTextError, MetaTextResult};
 
+/// Largest message length a peer can actually deliver.
+///
+/// The transport frame limit is 64 KiB and the ciphertext adds a nonce and a
+/// tag, so a configuration asking for more would be physically undeliverable.
+pub const MAX_MESSAGE_LENGTH: usize = 32 * 1024;
+
+/// Longest accepted auto-save interval, in seconds (24 hours).
+pub const MAX_AUTO_SAVE_INTERVAL: u64 = 24 * 60 * 60;
+
+/// Longest accepted outbound connection timeout, in seconds (one hour).
+pub const MAX_CONNECTION_TIMEOUT: u64 = 60 * 60;
+
+/// Database backends this build understands.
+pub const SUPPORTED_DATABASES: [&str; 3] = ["sqlite", "postgres", "mysql"];
+
+/// Encryption algorithms this build understands.
+pub const SUPPORTED_ALGORITHMS: [&str; 1] = ["ChaCha20-Poly1305"];
+
+/// Key derivation functions this build understands.
+pub const SUPPORTED_KDFS: [&str; 1] = ["Argon2"];
+
 /// Main application configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -278,46 +299,167 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Collect every configuration problem.
+    ///
+    /// The list is returned in full instead of stopping at the first problem so
+    /// an operator can fix a configuration file in one pass.
+    ///
+    /// # Returns
+    ///
+    /// Returns every problem found; an empty vector means the configuration is
+    /// consistent and usable.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use meta_text::config::AppConfig;
+    ///
+    /// assert!(AppConfig::default().problems().is_empty());
+    ///
+    /// let mut broken = AppConfig::default();
+    /// broken.network.port = 0;
+    /// assert_eq!(broken.problems().len(), 1);
+    /// ```
+    #[must_use]
+    pub fn problems(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // -- [app] ----------------------------------------------------------
+        if self.app.name.trim().is_empty() {
+            errors.push("app.name cannot be empty".to_string());
+        }
+        if self.app.version.trim().is_empty() {
+            errors.push("app.version cannot be empty".to_string());
+        }
+        if self.app.max_friends == 0 {
+            errors.push("app.max_friends must be greater than 0".to_string());
+        }
+        if self.app.max_message_length == 0 {
+            errors.push("app.max_message_length must be greater than 0".to_string());
+        }
+        // A message is framed and encrypted; anything beyond the transport
+        // frame limit could never be delivered anyway.
+        if self.app.max_message_length > MAX_MESSAGE_LENGTH {
+            errors.push(format!(
+                "app.max_message_length must be at most {MAX_MESSAGE_LENGTH}"
+            ));
+        }
+        if self.app.auto_save_interval > MAX_AUTO_SAVE_INTERVAL {
+            errors.push(format!(
+                "app.auto_save_interval must be at most {MAX_AUTO_SAVE_INTERVAL} seconds"
+            ));
+        }
+
+        // -- [network] ------------------------------------------------------
+        if self.network.port == 0 {
+            errors.push("network.port cannot be 0".to_string());
+        }
+        if self.network.max_connections == 0 {
+            errors.push("network.max_connections must be greater than 0".to_string());
+        }
+        if self.network.connection_timeout == 0 {
+            errors.push("network.connection_timeout must be greater than 0".to_string());
+        }
+        if self.network.connection_timeout > MAX_CONNECTION_TIMEOUT {
+            errors.push(format!(
+                "network.connection_timeout must be at most {MAX_CONNECTION_TIMEOUT} seconds"
+            ));
+        }
+        for node in &self.network.bootstrap_nodes {
+            if !crate::utils::is_valid_host_port(node) {
+                errors.push(format!(
+                    "network.bootstrap_nodes entry is not a host:port address: {node}"
+                ));
+            }
+        }
+
+        // -- [database] -----------------------------------------------------
+        if self.database.connection_string.trim().is_empty() {
+            errors.push("database.connection_string cannot be empty".to_string());
+        }
+        if self.database.max_connections == 0 {
+            errors.push("database.max_connections must be greater than 0".to_string());
+        }
+        if !SUPPORTED_DATABASES
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case(self.database.database_type.trim()))
+        {
+            errors.push(format!(
+                "database.database_type must be one of {SUPPORTED_DATABASES:?}, found '{}'",
+                self.database.database_type
+            ));
+        }
+
+        // -- [crypto] -------------------------------------------------------
+        if !SUPPORTED_ALGORITHMS
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(self.crypto.algorithm.trim()))
+        {
+            errors.push(format!(
+                "crypto.algorithm must be one of {SUPPORTED_ALGORITHMS:?}, found '{}'",
+                self.crypto.algorithm
+            ));
+        }
+        if !SUPPORTED_KDFS
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(self.crypto.kdf.trim()))
+        {
+            errors.push(format!(
+                "crypto.kdf must be one of {SUPPORTED_KDFS:?}, found '{}'",
+                self.crypto.kdf
+            ));
+        }
+
+        // -- [ui] -----------------------------------------------------------
+        if self.ui.theme.trim().is_empty() {
+            errors.push("ui.theme cannot be empty".to_string());
+        }
+        if self.ui.message_format.trim().is_empty() {
+            errors.push("ui.message_format cannot be empty".to_string());
+        }
+
+        // -- [logging] ------------------------------------------------------
+        if crate::cli::LogLevel::parse(self.logging.level.trim()).is_none() {
+            errors.push(format!(
+                "logging.level must be one of error, warn, info, debug, trace; found '{}'",
+                self.logging.level
+            ));
+        }
+        if self.logging.enable_file && self.logging.file_path.trim().is_empty() {
+            errors
+                .push("logging.file_path cannot be empty when file logging is enabled".to_string());
+        }
+        if self.logging.rotation_size_mb == 0 {
+            errors.push("logging.rotation_size_mb must be greater than 0".to_string());
+        }
+        if self.logging.max_files == 0 {
+            errors.push("logging.max_files must be greater than 0".to_string());
+        }
+
+        errors
+    }
+
     /// Validate configuration settings
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if configuration is valid, or a list of validation errors.
+    /// Returns `Ok(())` if configuration is valid, or an error listing every
+    /// problem found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetaTextError::Configuration`] when [`AppConfig::problems`] is
+    /// not empty.
     pub fn validate(&self) -> MetaTextResult<()> {
-        let mut errors = Vec::new();
-
-        // Validate app settings
-        if self.app.name.is_empty() {
-            errors.push("Application name cannot be empty".to_string());
-        }
-        if self.app.max_friends == 0 {
-            errors.push("Maximum friends must be greater than 0".to_string());
-        }
-        if self.app.max_message_length == 0 {
-            errors.push("Maximum message length must be greater than 0".to_string());
+        let errors = self.problems();
+        if errors.is_empty() {
+            return Ok(());
         }
 
-        // Validate network settings
-        if self.network.port == 0 {
-            errors.push("Network port cannot be 0".to_string());
-        }
-        if self.network.max_connections == 0 {
-            errors.push("Maximum connections must be greater than 0".to_string());
-        }
-
-        // Validate database settings
-        if self.database.connection_string.is_empty() {
-            errors.push("Database connection string cannot be empty".to_string());
-        }
-
-        if !errors.is_empty() {
-            return Err(MetaTextError::Configuration {
-                message: format!("Configuration validation failed: {}", errors.join(", ")),
-                source: None,
-            });
-        }
-
-        Ok(())
+        Err(MetaTextError::Configuration {
+            message: format!("Configuration validation failed: {}", errors.join(", ")),
+            source: None,
+        })
     }
 }
 
@@ -453,6 +595,106 @@ mod tests {
 
         // Invalid config should fail
         config.app.name = String::new();
+        assert!(config.validate().is_err());
+    }
+
+    /// The default configuration ships clean.
+    #[test]
+    fn test_default_configuration_has_no_problems() {
+        assert_eq!(AppConfig::default().problems(), Vec::<String>::new());
+    }
+
+    /// Every field with a limit is actually checked.
+    #[test]
+    fn test_problems_cover_every_section() {
+        type Mutate = fn(&mut AppConfig);
+        let cases: Vec<(&str, Mutate)> = vec![
+            ("app.name", |c| c.app.name = "  ".to_string()),
+            ("app.version", |c| c.app.version = String::new()),
+            ("app.max_friends", |c| c.app.max_friends = 0),
+            ("app.max_message_length", |c| c.app.max_message_length = 0),
+            ("app.max_message_length (upper)", |c| {
+                c.app.max_message_length = MAX_MESSAGE_LENGTH + 1;
+            }),
+            ("app.auto_save_interval", |c| {
+                c.app.auto_save_interval = MAX_AUTO_SAVE_INTERVAL + 1;
+            }),
+            ("network.port", |c| c.network.port = 0),
+            ("network.max_connections", |c| c.network.max_connections = 0),
+            ("network.connection_timeout (zero)", |c| {
+                c.network.connection_timeout = 0;
+            }),
+            ("network.connection_timeout (upper)", |c| {
+                c.network.connection_timeout = MAX_CONNECTION_TIMEOUT + 1;
+            }),
+            ("network.bootstrap_nodes", |c| {
+                c.network.bootstrap_nodes = vec!["not-an-address".to_string()];
+            }),
+            ("database.connection_string", |c| {
+                c.database.connection_string = "   ".to_string();
+            }),
+            ("database.database_type", |c| {
+                c.database.database_type = "mongodb".to_string();
+            }),
+            ("database.max_connections", |c| {
+                c.database.max_connections = 0;
+            }),
+            ("crypto.algorithm", |c| {
+                c.crypto.algorithm = "ROT13".to_string()
+            }),
+            ("crypto.kdf", |c| c.crypto.kdf = "md5".to_string()),
+            ("ui.theme", |c| c.ui.theme = String::new()),
+            ("ui.message_format", |c| c.ui.message_format = String::new()),
+            ("logging.level", |c| c.logging.level = "verbose".to_string()),
+            ("logging.file_path", |c| {
+                c.logging.enable_file = true;
+                c.logging.file_path = "  ".to_string();
+            }),
+            ("logging.rotation_size_mb", |c| {
+                c.logging.rotation_size_mb = 0
+            }),
+            ("logging.max_files", |c| c.logging.max_files = 0),
+        ];
+
+        for (field, mutate) in cases {
+            let mut config = AppConfig::default();
+            mutate(&mut config);
+            let problems = config.problems();
+            assert!(
+                !problems.is_empty(),
+                "{field} should have been rejected but was accepted"
+            );
+            assert!(
+                config.validate().is_err(),
+                "{field} should make validate() fail"
+            );
+        }
+    }
+
+    /// Every problem is reported, not just the first one.
+    #[test]
+    fn test_problems_are_reported_together() {
+        let mut config = AppConfig::default();
+        config.app.name = String::new();
+        config.network.port = 0;
+        config.crypto.kdf = "nope".to_string();
+
+        let problems = config.problems();
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("app.name")));
+        assert!(problems.iter().any(|p| p.contains("network.port")));
+        assert!(problems.iter().any(|p| p.contains("crypto.kdf")));
+    }
+
+    /// File logging is only required to have a path when it is enabled.
+    #[test]
+    fn test_logging_file_path_only_required_when_enabled() {
+        let mut config = AppConfig::default();
+        config.logging.enable_file = false;
+        config.logging.file_path = String::new();
+        assert!(config.validate().is_ok());
+
+        config.logging.enable_file = true;
         assert!(config.validate().is_err());
     }
 }

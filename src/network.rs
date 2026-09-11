@@ -48,8 +48,16 @@ const MESSAGE_ID_LEN: usize = 8;
 /// bound before any allocation happens.
 const MAX_FRAME_SIZE: u32 = 64 * 1024;
 
-/// How long to wait for a TCP connection to be established.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fallback connect timeout, used when the configuration asks for zero.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many transport events may wait for the core before the transport is
+/// throttled.
+///
+/// The channel is bounded so that a peer sending frames faster than the core
+/// can absorb them slows the peer down instead of growing the queue. The value
+/// is generous enough that normal bursts never block.
+pub const EVENT_INBOX_CAPACITY: usize = 1024;
 
 /// How often the supervisor retries desired peers that are not connected.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
@@ -134,8 +142,12 @@ struct Shared {
     /// Encryption used for both directions
     crypto: Arc<CryptoManager>,
 
-    /// Application event channel
-    event_sender: mpsc::UnboundedSender<AppEvent>,
+    /// Application event channel.
+    ///
+    /// This is a *bounded* channel: when the core is busy the transport is
+    /// slowed down instead of accumulating events without limit. Sends must be
+    /// awaited, which is why [`Shared::dispatch`] is asynchronous.
+    event_sender: mpsc::Sender<AppEvent>,
 
     /// Nickname announced to peers
     nickname: Arc<RwLock<String>>,
@@ -158,6 +170,9 @@ struct Shared {
 
     /// Upper bound on concurrent inbound connections
     max_connections: u32,
+
+    /// How long a single outbound connection attempt may take
+    connect_timeout: Duration,
 }
 
 /// Network manager for handling P2P communication
@@ -172,6 +187,9 @@ pub struct NetworkManager {
     /// Maximum connections
     max_connections: u32,
 
+    /// How long a single outbound connection attempt may take
+    connect_timeout: Duration,
+
     /// Whether the network is started
     started: bool,
 
@@ -179,7 +197,7 @@ pub struct NetworkManager {
     crypto: Arc<CryptoManager>,
 
     /// Application event channel
-    event_sender: mpsc::UnboundedSender<AppEvent>,
+    event_sender: mpsc::Sender<AppEvent>,
 
     /// Nickname announced to peers
     nickname: Arc<RwLock<String>>,
@@ -213,7 +231,9 @@ impl NetworkManager {
     ///
     /// * `config` - Network configuration
     /// * `crypto_manager` - Encryption shared with the application
-    /// * `event_sender` - Channel used to deliver network events to the app
+    /// * `event_sender` - Bounded channel used to deliver events to the core.
+    ///   The transport awaits it, so a slow consumer throttles the transport
+    ///   instead of growing an unbounded queue.
     ///
     /// # Returns
     ///
@@ -227,7 +247,7 @@ impl NetworkManager {
     pub async fn new(
         config: &crate::config::NetworkConfig,
         crypto_manager: Arc<CryptoManager>,
-        event_sender: mpsc::UnboundedSender<AppEvent>,
+        event_sender: mpsc::Sender<AppEvent>,
     ) -> MetaTextResult<Self> {
         let timestamp = chrono::Utc::now();
         info!(
@@ -239,6 +259,11 @@ impl NetworkManager {
             port: config.port,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             max_connections: config.max_connections,
+            connect_timeout: if config.connection_timeout == 0 {
+                DEFAULT_CONNECT_TIMEOUT
+            } else {
+                Duration::from_secs(config.connection_timeout)
+            },
             started: false,
             crypto: crypto_manager,
             event_sender,
@@ -453,7 +478,7 @@ impl NetworkManager {
         // re-establishes them if the connection drops.
         self.desire_peer(address);
 
-        let stream = dial(address).await?;
+        let stream = dial(address, self.connect_timeout).await?;
 
         let remote = stream.peer_addr().map_err(|error| MetaTextError::Network {
             message: format!("Failed to read the peer address: {error}"),
@@ -702,6 +727,7 @@ impl NetworkManager {
             outbox: Arc::clone(&self.outbox),
             outbox_expired: Arc::clone(&self.outbox_expired),
             max_connections: self.max_connections,
+            connect_timeout: self.connect_timeout,
         }
     }
 }
@@ -712,8 +738,8 @@ impl NetworkManager {
 ///
 /// Returns [`MetaTextError::Network`] on resolution, timeout or connection
 /// failure.
-async fn dial(address: &str) -> MetaTextResult<TcpStream> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+async fn dial(address: &str, connect_timeout: Duration) -> MetaTextResult<TcpStream> {
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(address))
         .await
         .map_err(|_| MetaTextError::Network {
             message: format!("Timed out connecting to {address}"),
@@ -815,7 +841,7 @@ impl Shared {
                 .unwrap_or_default();
 
             for address in pending {
-                match dial(&address).await {
+                match dial(&address, self.connect_timeout).await {
                     Ok(stream) => match stream.peer_addr() {
                         Ok(remote) => match self.register(stream, remote).await {
                             Ok(()) => {
@@ -883,7 +909,8 @@ impl Shared {
             .send(AppEvent::NetworkEvent(NetworkEvent::PeerConnected {
                 peer_id: remote.to_string(),
                 metadata: HashMap::new(),
-            }));
+            }))
+            .await;
 
         Ok(())
     }
@@ -901,7 +928,7 @@ impl Shared {
     async fn read_loop(&self, mut reader: ReadHalf<TcpStream>, remote: SocketAddr) {
         loop {
             match read_frame(&mut reader).await {
-                Ok(Some((kind, payload))) => self.dispatch(kind, &payload, remote),
+                Ok(Some((kind, payload))) => self.dispatch(kind, &payload, remote).await,
                 // Clean end of stream: the peer closed the connection.
                 Ok(None) => break,
                 Err(error) => {
@@ -929,7 +956,8 @@ impl Shared {
             .send(AppEvent::NetworkEvent(NetworkEvent::PeerDisconnected {
                 peer_id: remote.to_string(),
                 reason: "connection closed".to_string(),
-            }));
+            }))
+            .await;
     }
 
     /// Write queued frames until the channel closes
@@ -949,7 +977,11 @@ impl Shared {
     }
 
     /// Handle a single inbound frame
-    fn dispatch(&self, kind: u8, payload: &[u8], remote: SocketAddr) {
+    ///
+    /// Asynchronous because the event channel applies backpressure: a peer
+    /// flooding frames is throttled to the rate the core can absorb instead of
+    /// growing a queue without bound.
+    async fn dispatch(&self, kind: u8, payload: &[u8], remote: SocketAddr) {
         match kind {
             FRAME_HELLO => {
                 let nickname = String::from_utf8_lossy(payload).to_string();
@@ -966,12 +998,13 @@ impl Shared {
                     info!("📬 Flushed {flushed} queued message(s) to '{nickname}'");
                 }
 
-                let _ =
-                    self.event_sender
-                        .send(AppEvent::NetworkEvent(NetworkEvent::PeerConnected {
-                            peer_id: remote.to_string(),
-                            metadata: HashMap::from([("nickname".to_string(), nickname)]),
-                        }));
+                let _ = self
+                    .event_sender
+                    .send(AppEvent::NetworkEvent(NetworkEvent::PeerConnected {
+                        peer_id: remote.to_string(),
+                        metadata: HashMap::from([("nickname".to_string(), nickname)]),
+                    }))
+                    .await;
             }
             FRAME_MESSAGE => {
                 let Some(message_id) = decode_message_id(payload) else {
@@ -982,11 +1015,14 @@ impl Shared {
 
                 match self.crypto.decrypt(ciphertext) {
                     Ok(plaintext) => {
-                        let _ = self.event_sender.send(AppEvent::MessageReceived {
-                            peer: self.nickname_of(remote),
-                            peer_id: remote.to_string(),
-                            payload: plaintext,
-                        });
+                        let _ = self
+                            .event_sender
+                            .send(AppEvent::MessageReceived {
+                                peer: self.nickname_of(remote),
+                                peer_id: remote.to_string(),
+                                payload: plaintext,
+                            })
+                            .await;
 
                         // Acknowledge receipt so the sender can report delivery.
                         let ack = encode_frame(FRAME_ACK, &message_id.to_be_bytes());
@@ -1002,11 +1038,14 @@ impl Shared {
                     warn!("⚠️ Ack frame without an id from {remote}");
                     return;
                 };
-                let _ = self.event_sender.send(AppEvent::MessageDelivered {
-                    peer: self.nickname_of(remote),
-                    peer_id: remote.to_string(),
-                    message_id,
-                });
+                let _ = self
+                    .event_sender
+                    .send(AppEvent::MessageDelivered {
+                        peer: self.nickname_of(remote),
+                        peer_id: remote.to_string(),
+                        message_id,
+                    })
+                    .await;
             }
             other => warn!("⚠️ Unknown frame kind {other} from {remote}"),
         }
@@ -1204,7 +1243,7 @@ mod tests {
     }
 
     /// A manager using a passphrase derived key, plus its event receiver
-    async fn test_manager(passphrase: &str) -> (NetworkManager, mpsc::UnboundedReceiver<AppEvent>) {
+    async fn test_manager(passphrase: &str) -> (NetworkManager, mpsc::Receiver<AppEvent>) {
         test_manager_on(passphrase, 0).await
     }
 
@@ -1212,12 +1251,12 @@ mod tests {
     async fn test_manager_on(
         passphrase: &str,
         port: u16,
-    ) -> (NetworkManager, mpsc::UnboundedReceiver<AppEvent>) {
+    ) -> (NetworkManager, mpsc::Receiver<AppEvent>) {
         let crypto = Arc::new(
             CryptoManager::from_passphrase(&crate::config::CryptoConfig::default(), passphrase)
                 .expect("derive key"),
         );
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(EVENT_INBOX_CAPACITY);
         let mut config = loopback_config();
         config.port = port;
 
@@ -1263,7 +1302,7 @@ mod tests {
             true,
             "ChaCha20-Poly1305".to_string(),
         ));
-        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = mpsc::channel(EVENT_INBOX_CAPACITY);
 
         let manager = NetworkManager::new(&config, crypto_manager, event_sender)
             .await
@@ -1535,9 +1574,7 @@ mod tests {
     }
 
     /// Wait for the next message event, returning `(sender, text)`
-    async fn next_message_from(
-        receiver: &mut mpsc::UnboundedReceiver<AppEvent>,
-    ) -> (String, String) {
+    async fn next_message_from(receiver: &mut mpsc::Receiver<AppEvent>) -> (String, String) {
         loop {
             match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
                 Ok(Some(AppEvent::MessageReceived { peer, payload, .. })) => {
@@ -1551,7 +1588,7 @@ mod tests {
     }
 
     /// Wait for the next delivery confirmation, returning `(peer, message_id)`
-    async fn next_delivery(receiver: &mut mpsc::UnboundedReceiver<AppEvent>) -> (String, u64) {
+    async fn next_delivery(receiver: &mut mpsc::Receiver<AppEvent>) -> (String, u64) {
         loop {
             match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
                 Ok(Some(AppEvent::MessageDelivered {
@@ -1567,7 +1604,7 @@ mod tests {
     }
 
     /// Wait for the next message event, skipping unrelated network events
-    async fn next_message(receiver: &mut mpsc::UnboundedReceiver<AppEvent>) -> String {
+    async fn next_message(receiver: &mut mpsc::Receiver<AppEvent>) -> String {
         next_message_from(receiver).await.1
     }
 }

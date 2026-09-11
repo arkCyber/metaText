@@ -17,7 +17,6 @@ use tracing::warn;
 use tracing::{debug, info};
 
 use crate::error::MetaTextResult;
-use crate::types::AppEvent;
 
 #[cfg(feature = "terminal-ui")]
 use crate::error::MetaTextError;
@@ -28,6 +27,218 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of console lines kept for the TUI scrollback.
 pub const OUTPUT_CAPACITY: usize = 1000;
+
+/// How many submitted lines the full screen input keeps for recall.
+pub const INPUT_HISTORY_CAPACITY: usize = 100;
+
+/// Editable single line input buffer with a command history.
+///
+/// The full screen interface reads raw key events instead of buffered lines,
+/// so it needs its own line editor: this type owns the draft text, the cursor
+/// position and the history that `Up` / `Down` navigate. It is deliberately
+/// independent of any terminal, which makes the editing rules unit testable
+/// without a TTY.
+///
+/// Positions are counted in `char`s, so the cursor stays correct for multi-byte
+/// input. The history is bounded by [`INPUT_HISTORY_CAPACITY`].
+#[derive(Debug, Default)]
+pub struct InputBuffer {
+    /// The draft line, split into characters for cursor arithmetic.
+    chars: Vec<char>,
+
+    /// Cursor position as a character index in `0..=chars.len()`.
+    cursor: usize,
+
+    /// Submitted, non-empty lines, oldest first.
+    history: Vec<String>,
+
+    /// Index into `history` while browsing it, or `None` when editing.
+    history_index: Option<usize>,
+
+    /// Draft preserved while browsing the history, restored on `Down`.
+    draft: String,
+}
+
+impl InputBuffer {
+    /// Create an empty buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current draft as a `String`.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    /// Cursor position as a character offset from the start of the line.
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether the draft is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+
+    /// Insert one character at the cursor and move past it.
+    pub fn insert(&mut self, character: char) {
+        self.chars.insert(self.cursor, character);
+        self.cursor += 1;
+        self.stop_browsing();
+    }
+
+    /// Insert a whole string at the cursor (used for pasted input).
+    pub fn insert_str(&mut self, text: &str) {
+        for character in text.chars() {
+            self.chars.insert(self.cursor, character);
+            self.cursor += 1;
+        }
+        self.stop_browsing();
+    }
+
+    /// Delete the character before the cursor.
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+        self.stop_browsing();
+    }
+
+    /// Delete the character under the cursor.
+    pub fn delete(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.chars.remove(self.cursor);
+        }
+        self.stop_browsing();
+    }
+
+    /// Drop the whole draft and put the cursor back at the start (Ctrl+U).
+    pub fn clear(&mut self) {
+        self.chars.clear();
+        self.cursor = 0;
+        self.stop_browsing();
+    }
+
+    /// Move the cursor one character left.
+    pub const fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move the cursor one character right.
+    pub const fn move_right(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// Move the cursor to the start of the line (Home / Ctrl+A).
+    pub const fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the cursor to the end of the line (End / Ctrl+E).
+    pub const fn move_end(&mut self) {
+        self.cursor = self.chars.len();
+    }
+
+    /// Submit the draft: return it, clear the line and record it in history.
+    ///
+    /// Whitespace-only lines are returned but not stored, and a line equal to
+    /// the newest entry is not stored twice, so repeatedly pressing Enter does
+    /// not fill the history.
+    pub fn submit(&mut self) -> String {
+        let line = self.text();
+        self.chars.clear();
+        self.cursor = 0;
+        self.stop_browsing();
+
+        if !line.trim().is_empty() && self.history.last() != Some(&line) {
+            if self.history.len() >= INPUT_HISTORY_CAPACITY {
+                self.history.remove(0);
+            }
+            self.history.push(line.clone());
+        }
+        line
+    }
+
+    /// Recall the previous entry (`Up`).
+    ///
+    /// The first call stashes the current draft so it can be restored; further
+    /// calls walk back through the history and stop at the oldest entry.
+    pub fn history_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+
+        let next = match self.history_index {
+            Some(0) => 0,
+            Some(index) => index - 1,
+            None => {
+                self.draft = self.text();
+                self.history.len() - 1
+            }
+        };
+        self.history_index = Some(next);
+        self.set_from_history(next);
+    }
+
+    /// Recall the next entry (`Down`), restoring the draft past the newest one.
+    pub fn history_next(&mut self) {
+        match self.history_index {
+            // Not browsing: nothing to recall forward.
+            None => {}
+            Some(index) if index + 1 < self.history.len() => {
+                self.history_index = Some(index + 1);
+                self.set_from_history(index + 1);
+            }
+            // Past the newest entry: give the user their half-typed draft back.
+            Some(_) => {
+                self.history_index = None;
+                let draft = std::mem::take(&mut self.draft);
+                self.chars = draft.chars().collect();
+                self.cursor = self.chars.len();
+            }
+        }
+    }
+
+    /// The stored history, oldest first.
+    #[must_use]
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
+    /// Replace the draft with `history[index]`, cursor at the end.
+    fn set_from_history(&mut self, index: usize) {
+        if let Some(line) = self.history.get(index) {
+            self.chars = line.chars().collect();
+            self.cursor = self.chars.len();
+        }
+    }
+
+    /// Stop browsing the history and drop the stashed draft.
+    fn stop_browsing(&mut self) {
+        self.history_index = None;
+        self.draft.clear();
+    }
+}
+
+/// Input produced by the full screen interface.
+///
+/// The rendering engine deliberately knows nothing about the application
+/// domain: it only reports what the user typed and when they want to leave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiInput {
+    /// A line the user submitted with Enter.
+    Line(String),
+
+    /// The user asked to leave (Ctrl+C or Ctrl+Q).
+    Quit,
+}
 
 /// Process wide console output sink.
 ///
@@ -217,7 +428,7 @@ pub type SharedTuiInfo = Arc<Mutex<TuiInfo>>;
 #[derive(Debug)]
 pub struct TuiManager {
     /// Event sender for communicating with main app
-    event_sender: tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    event_sender: tokio::sync::mpsc::UnboundedSender<TuiInput>,
 
     /// Whether TUI is started
     started: bool,
@@ -243,7 +454,7 @@ impl TuiManager {
     /// backends can validate the terminal before the manager is constructed.
     pub async fn new(
         _config: &str,
-        event_sender: tokio::sync::mpsc::UnboundedSender<AppEvent>,
+        event_sender: tokio::sync::mpsc::UnboundedSender<TuiInput>,
     ) -> MetaTextResult<Self> {
         let timestamp = chrono::Utc::now();
         info!(
@@ -405,13 +616,13 @@ impl TuiManager {
     ///
     /// The event channel connects the user interface with the application
     /// coordinator. Input handlers (for example the interactive REPL reader)
-    /// use this sender to forward [`AppEvent::UserInput`] messages.
+    /// use this sender to forward input lines from the interface.
     ///
     /// # Returns
     ///
     /// Returns a cloned handle to the unbounded application event sender.
     #[must_use]
-    pub fn event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<AppEvent> {
+    pub fn event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<TuiInput> {
         self.event_sender.clone()
     }
 }
@@ -459,10 +670,11 @@ impl TuiManager {
 /// screen cannot be enabled.
 #[cfg(feature = "terminal-ui")]
 fn run_interface(
-    sender: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    sender: &tokio::sync::mpsc::UnboundedSender<TuiInput>,
     info: &SharedTuiInfo,
     active: &AtomicBool,
 ) -> Result<(), MetaTextError> {
+    use crossterm::event::DisableBracketedPaste;
     use crossterm::execute;
     use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 
@@ -477,7 +689,11 @@ fn run_interface(
     // Restore the terminal no matter how the loop ended.
     let _ = terminal.show_cursor();
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    );
     Ok(())
 }
 
@@ -485,6 +701,7 @@ fn run_interface(
 #[cfg(feature = "terminal-ui")]
 fn setup_terminal(
 ) -> std::io::Result<tui::Terminal<tui::backend::CrosstermBackend<std::io::Stdout>>> {
+    use crossterm::event::EnableBracketedPaste;
     use crossterm::execute;
     use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
     use tui::backend::CrosstermBackend;
@@ -492,62 +709,163 @@ fn setup_terminal(
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     Terminal::new(CrosstermBackend::new(stdout))
+}
+
+/// What one key press asks the full screen interface to do.
+///
+/// The mapping is separated from the event loop so it can be unit tested
+/// without a terminal; the loop only performs the effect.
+#[cfg(feature = "terminal-ui")]
+#[derive(Debug, PartialEq, Eq)]
+enum KeyAction {
+    /// The key only changed the input buffer; nothing else to do.
+    None,
+
+    /// A complete line was submitted and should be dispatched.
+    Line(String),
+
+    /// The user asked to leave.
+    Quit,
+
+    /// The user asked to clear the scrollback (Ctrl+L).
+    ClearOutput,
+
+    /// Scroll the conversation pane up (`PageUp`).
+    ScrollUp,
+
+    /// Scroll the conversation pane down (`PageDown`).
+    ScrollDown,
+}
+
+/// Apply one key press to the input buffer and report what to do next.
+///
+/// `Char` keys are treated as text unless a control modifier is present, so
+/// `Ctrl+A` / `Ctrl+E` jump to the line ends and `Ctrl+U` clears it instead of
+/// inserting letters. Bracketed paste is handled by the caller.
+#[cfg(feature = "terminal-ui")]
+fn apply_key(input: &mut InputBuffer, key: crossterm::event::KeyEvent) -> KeyAction {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    if key.kind != KeyEventKind::Press {
+        return KeyAction::None;
+    }
+
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('c' | 'q') if control => KeyAction::Quit,
+        KeyCode::Char('u') if control => {
+            input.clear();
+            KeyAction::None
+        }
+        KeyCode::Char('a') if control => {
+            input.move_home();
+            KeyAction::None
+        }
+        KeyCode::Char('e') if control => {
+            input.move_end();
+            KeyAction::None
+        }
+        KeyCode::Char('l') if control => KeyAction::ClearOutput,
+        KeyCode::Char(character) if !control => {
+            input.insert(character);
+            KeyAction::None
+        }
+        KeyCode::Backspace => {
+            input.backspace();
+            KeyAction::None
+        }
+        KeyCode::Delete => {
+            input.delete();
+            KeyAction::None
+        }
+        KeyCode::Left => {
+            input.move_left();
+            KeyAction::None
+        }
+        KeyCode::Right => {
+            input.move_right();
+            KeyAction::None
+        }
+        KeyCode::Home => {
+            input.move_home();
+            KeyAction::None
+        }
+        KeyCode::End => {
+            input.move_end();
+            KeyAction::None
+        }
+        KeyCode::Up => {
+            input.history_previous();
+            KeyAction::None
+        }
+        KeyCode::Down => {
+            input.history_next();
+            KeyAction::None
+        }
+        KeyCode::Esc => {
+            input.clear();
+            KeyAction::None
+        }
+        KeyCode::Enter => KeyAction::Line(input.submit()),
+        KeyCode::PageUp => KeyAction::ScrollUp,
+        KeyCode::PageDown => KeyAction::ScrollDown,
+        _ => KeyAction::None,
+    }
 }
 
 /// Poll for keyboard input and redraw the interface until asked to stop.
 #[cfg(feature = "terminal-ui")]
 fn render_loop(
     terminal: &mut tui::Terminal<tui::backend::CrosstermBackend<std::io::Stdout>>,
-    sender: &tokio::sync::mpsc::UnboundedSender<AppEvent>,
+    sender: &tokio::sync::mpsc::UnboundedSender<TuiInput>,
     info: &SharedTuiInfo,
     active: &AtomicBool,
 ) {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::event::{self, Event};
     use std::time::Duration;
 
-    let mut input = String::new();
+    let mut input = InputBuffer::new();
     let mut scroll: usize = 0;
 
     while active.load(Ordering::SeqCst) {
         let lines = output_sink().snapshot();
         let snapshot = info.lock().map(|guard| guard.clone()).unwrap_or_default();
+        let draft = input.text();
 
-        let _ = terminal.draw(|frame| draw_interface(frame, &snapshot, &lines, &input, scroll));
+        let _ = terminal.draw(|frame| {
+            draw_interface(frame, &snapshot, &lines, &draft, input.cursor(), scroll);
+        });
 
         if !event::poll(Duration::from_millis(50)).unwrap_or(false) {
             continue;
         }
 
-        let Ok(Event::Key(key)) = event::read() else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('c' | 'q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let _ = sender.send(AppEvent::Shutdown);
-                break;
-            }
-            KeyCode::Char(character) => input.push(character),
-            KeyCode::Backspace => {
-                input.pop();
-            }
-            KeyCode::Esc => input.clear(),
-            KeyCode::Enter => {
-                let line = std::mem::take(&mut input);
-                scroll = 0;
-                if sender.send(AppEvent::UserInput(line)).is_err() {
+        match event::read() {
+            Ok(Event::Key(key)) => match apply_key(&mut input, key) {
+                KeyAction::None => {}
+                KeyAction::Quit => {
+                    let _ = sender.send(TuiInput::Quit);
                     break;
                 }
-            }
-            KeyCode::PageUp => {
-                scroll = (scroll + 5).min(lines.len().saturating_sub(1));
-            }
-            KeyCode::PageDown => scroll = scroll.saturating_sub(5),
+                KeyAction::Line(line) => {
+                    scroll = 0;
+                    if sender.send(TuiInput::Line(line)).is_err() {
+                        break;
+                    }
+                }
+                KeyAction::ClearOutput => {
+                    clear_output();
+                    scroll = 0;
+                }
+                KeyAction::ScrollUp => {
+                    scroll = (scroll + 5).min(lines.len().saturating_sub(1));
+                }
+                KeyAction::ScrollDown => scroll = scroll.saturating_sub(5),
+            },
+            // Bracketed paste arrives as one event instead of a key storm.
+            Ok(Event::Paste(text)) => input.insert_str(&text),
             _ => {}
         }
     }
@@ -563,6 +881,7 @@ fn draw_interface<B: tui::backend::Backend>(
     info: &TuiInfo,
     lines: &[String],
     input: &str,
+    cursor: usize,
     scroll: usize,
 ) {
     use tui::layout::{Constraint, Direction, Layout};
@@ -586,7 +905,7 @@ fn draw_interface<B: tui::backend::Backend>(
 
     draw_sidebar(frame, body[0], info);
     draw_log(frame, body[1], info, lines, scroll);
-    draw_input(frame, chunks[2], input);
+    draw_input(frame, chunks[2], input, cursor);
 }
 
 /// Header: identity and subsystem status on two lines
@@ -725,22 +1044,33 @@ fn draw_input<B: tui::backend::Backend>(
     frame: &mut tui::Frame<'_, B>,
     area: tui::layout::Rect,
     input: &str,
+    cursor: usize,
 ) {
     use tui::style::{Color, Style};
     use tui::text::{Span, Spans};
     use tui::widgets::{Block, Borders, Paragraph};
 
-    let footer = Paragraph::new(Spans::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Green)),
-        Span::raw(input),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Enter to send | Ctrl+C/Q quit | PgUp/PgDn scroll "),
-    );
+    let footer =
+        Paragraph::new(Spans::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Green)),
+            Span::raw(input),
+        ]))
+        .block(Block::default().borders(Borders::ALL).title(
+            " Enter send | Up/Down history | Ctrl+U clear | Ctrl+C/Q quit | PgUp/PgDn scroll ",
+        ));
 
     frame.render_widget(footer, area);
+
+    // Park the terminal cursor where the next character will be inserted so the
+    // user can see the caret while editing. The text starts after the left
+    // border and the `> ` prefix (three columns); the cursor is a character
+    // offset, which matches the widget's monospace assumption.
+    if area.height > 2 && area.width > 5 {
+        let offset = u16::try_from(cursor).unwrap_or(u16::MAX);
+        let x = area.x.saturating_add(3).saturating_add(offset);
+        let last_column = area.x + area.width - 2;
+        frame.set_cursor(x.min(last_column), area.y + 1);
+    }
 }
 
 #[cfg(test)]
@@ -749,7 +1079,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tui_manager_creation() {
-        let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel::<TuiInput>();
 
         let manager = TuiManager::new("config", event_sender).await.unwrap();
         assert!(!manager.is_started());
@@ -757,7 +1087,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tui_startup_shutdown() {
-        let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel::<TuiInput>();
 
         let mut manager = TuiManager::new("config", event_sender).await.unwrap();
 
@@ -825,7 +1155,7 @@ mod tests {
     /// The info handle shares state with the manager
     #[tokio::test]
     async fn test_tui_info_handle_is_shared() {
-        let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel::<TuiInput>();
         let manager = TuiManager::new("config", event_sender).await.unwrap();
 
         manager.info_handle().lock().unwrap().nickname = "Alice".to_string();
@@ -864,7 +1194,7 @@ mod tests {
         let lines = vec!["hello world".to_string()];
 
         terminal
-            .draw(|frame| draw_interface(frame, &info, &lines, "/help", 0))
+            .draw(|frame| draw_interface(frame, &info, &lines, "/help", 5, 0))
             .unwrap();
 
         let rendered: String = terminal
@@ -906,5 +1236,240 @@ mod tests {
 
         // The full screen interface owns its own input line.
         assert!(!should_show_prompt(true, true, true));
+    }
+
+    /// Typing, cursor movement and mid-line editing behave like a line editor
+    #[test]
+    fn test_input_buffer_edits_at_cursor() {
+        let mut input = InputBuffer::new();
+        input.insert_str("hlo");
+        assert_eq!(input.text(), "hlo");
+        assert_eq!(input.cursor(), 3);
+
+        // Move between `h` and `l` and insert the missing `e`.
+        input.move_left();
+        input.move_left();
+        assert_eq!(input.cursor(), 1);
+        input.insert('e');
+        assert_eq!(input.text(), "helo");
+        assert_eq!(input.cursor(), 2);
+
+        // Insert the missing `l`, then remove it again with Backspace.
+        input.move_end();
+        assert_eq!(input.cursor(), 4);
+        input.move_left();
+        input.insert('l');
+        assert_eq!(input.text(), "hello");
+        input.backspace();
+        assert_eq!(input.text(), "helo");
+
+        // Delete removes the character under the cursor.
+        input.move_home();
+        input.delete();
+        assert_eq!(input.text(), "elo");
+        assert_eq!(input.cursor(), 0);
+
+        // Home/End clamp instead of panicking.
+        input.move_left();
+        assert_eq!(input.cursor(), 0);
+        input.move_end();
+        input.move_right();
+        assert_eq!(input.cursor(), 3);
+
+        // Ctrl+U empties the line.
+        input.clear();
+        assert!(input.is_empty());
+        assert_eq!(input.cursor(), 0);
+    }
+
+    /// Multi-byte characters count as one cursor step
+    #[test]
+    fn test_input_buffer_handles_multibyte_characters() {
+        let mut input = InputBuffer::new();
+        input.insert_str("héllo");
+        assert_eq!(input.text(), "héllo");
+        assert_eq!(input.cursor(), 5);
+
+        input.move_left();
+        input.backspace();
+        assert_eq!(input.text(), "hélo");
+        assert_eq!(input.cursor(), 3);
+    }
+
+    /// Submitting stores history once, in order, and collapses duplicates
+    #[test]
+    fn test_input_buffer_history_recording() {
+        let mut input = InputBuffer::new();
+
+        input.insert_str("/help");
+        assert_eq!(input.submit(), "/help");
+        assert!(input.is_empty());
+
+        input.insert_str("/help");
+        assert_eq!(input.submit(), "/help");
+
+        // Empty input is returned but not recorded.
+        assert_eq!(input.submit(), String::new());
+
+        input.insert_str("/quit");
+        assert_eq!(input.submit(), "/quit");
+
+        assert_eq!(input.history(), &["/help".to_string(), "/quit".to_string()]);
+    }
+
+    /// Up/Down walk the history and restore the half-typed draft
+    #[test]
+    fn test_input_buffer_history_navigation() {
+        let mut input = InputBuffer::new();
+        for line in ["first", "second", "third"] {
+            input.insert_str(line);
+            input.submit();
+        }
+
+        // Start a fresh line, then recall backwards.
+        input.insert_str("draft");
+        input.history_previous();
+        assert_eq!(input.text(), "third");
+        input.history_previous();
+        assert_eq!(input.text(), "second");
+        input.history_previous();
+        assert_eq!(input.text(), "first");
+        // Walking back past the oldest entry stays there.
+        input.history_previous();
+        assert_eq!(input.text(), "first");
+
+        // Walking forward returns through the list to the stashed draft.
+        input.history_next();
+        assert_eq!(input.text(), "second");
+        input.history_next();
+        assert_eq!(input.text(), "third");
+        input.history_next();
+        assert_eq!(input.text(), "draft");
+
+        // Editing leaves browsing mode, so Down has nothing to recall.
+        input.history_previous();
+        input.insert('!');
+        assert_eq!(input.text(), "third!");
+        input.history_next();
+        assert_eq!(input.text(), "third!");
+    }
+
+    /// History is bounded so a long session cannot grow without limit
+    #[test]
+    fn test_input_buffer_history_is_bounded() {
+        let mut input = InputBuffer::new();
+        for index in 0..(INPUT_HISTORY_CAPACITY + 10) {
+            input.insert_str(&format!("line-{index}"));
+            input.submit();
+        }
+
+        assert_eq!(input.history().len(), INPUT_HISTORY_CAPACITY);
+        // The oldest entries were evicted, the newest one is present.
+        assert_eq!(input.history().first().unwrap(), "line-10");
+        assert_eq!(
+            input.history().last().unwrap(),
+            &format!("line-{}", INPUT_HISTORY_CAPACITY + 9)
+        );
+    }
+
+    /// The key mapping turns typing into a submitted line and drives history.
+    #[cfg(feature = "terminal-ui")]
+    #[test]
+    fn test_apply_key_typing_and_submit() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut input = InputBuffer::new();
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        for character in ['/', 'h', 'i'] {
+            assert_eq!(
+                apply_key(&mut input, plain(KeyCode::Char(character))),
+                KeyAction::None
+            );
+        }
+        assert_eq!(input.text(), "/hi");
+
+        assert_eq!(
+            apply_key(&mut input, plain(KeyCode::Enter)),
+            KeyAction::Line("/hi".to_string())
+        );
+        assert!(input.is_empty());
+    }
+
+    /// Control keys edit the line and can request quit or a screen clear.
+    #[cfg(feature = "terminal-ui")]
+    #[test]
+    fn test_apply_key_control_actions() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        let mut input = InputBuffer::new();
+        input.insert_str("abc");
+
+        // Ctrl+U clears the draft instead of inserting a `u`.
+        assert_eq!(
+            apply_key(&mut input, ctrl(KeyCode::Char('u'))),
+            KeyAction::None
+        );
+        assert!(input.is_empty());
+
+        // Ctrl+L asks for a scrollback clear, Ctrl+C / Ctrl+Q to quit.
+        assert_eq!(
+            apply_key(&mut input, ctrl(KeyCode::Char('l'))),
+            KeyAction::ClearOutput
+        );
+        assert_eq!(
+            apply_key(&mut input, ctrl(KeyCode::Char('c'))),
+            KeyAction::Quit
+        );
+        assert_eq!(
+            apply_key(&mut input, ctrl(KeyCode::Char('q'))),
+            KeyAction::Quit
+        );
+
+        // Page keys map to scrolling.
+        assert_eq!(
+            apply_key(
+                &mut input,
+                KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)
+            ),
+            KeyAction::ScrollUp
+        );
+        assert_eq!(
+            apply_key(
+                &mut input,
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)
+            ),
+            KeyAction::ScrollDown
+        );
+
+        // Releasing a key does nothing.
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        assert_eq!(apply_key(&mut input, release), KeyAction::None);
+    }
+
+    /// Up recalls the previous submitted line through the key mapping.
+    #[cfg(feature = "terminal-ui")]
+    #[test]
+    fn test_apply_key_history_recall() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut input = InputBuffer::new();
+
+        input.insert_str("/info");
+        assert_eq!(
+            apply_key(&mut input, key(KeyCode::Enter)),
+            KeyAction::Line("/info".to_string())
+        );
+
+        assert_eq!(apply_key(&mut input, key(KeyCode::Up)), KeyAction::None);
+        assert_eq!(input.text(), "/info");
+        assert_eq!(apply_key(&mut input, key(KeyCode::Down)), KeyAction::None);
+        assert!(input.is_empty());
     }
 }

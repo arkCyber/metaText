@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/arksong/meta-text-rust/security/advisories/new
+    url: https://github.com/arkCyber/metaText/security/advisories/new
     about: Please report security issues privately, not as public issues.
   - name: Questions and discussions
-    url: https://github.com/arksong/meta-text-rust/discussions
+    url: https://github.com/arkCyber/metaText/discussions
     about: Ask usage questions and share ideas here.

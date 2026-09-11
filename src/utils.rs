@@ -114,6 +114,49 @@ pub fn get_timestamp() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Check whether `address` looks like a usable `host:port` endpoint.
+///
+/// The check is deliberately structural rather than a DNS/IP parse: it must
+/// accept host names, IPv4 and bracketed IPv6 alike, and it must reject the
+/// ambiguous cases (empty host, port 0, more than a numeric tail).
+///
+/// # Arguments
+///
+/// * `address` - Candidate `host:port` string.
+///
+/// # Examples
+///
+/// ```rust
+/// use meta_text::utils::is_valid_host_port;
+///
+/// assert!(is_valid_host_port("127.0.0.1:33445"));
+/// assert!(is_valid_host_port("tox.example.org:3389"));
+/// assert!(is_valid_host_port("[::1]:33445"));
+/// assert!(!is_valid_host_port("no-port"));
+/// assert!(!is_valid_host_port("host:0"));
+/// ```
+#[must_use]
+pub fn is_valid_host_port(address: &str) -> bool {
+    let address = address.trim();
+
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        // Bracketed IPv6 keeps its colons inside the brackets.
+        match rest.split_once("]:") {
+            Some(parts) => parts,
+            None => return false,
+        }
+    } else {
+        match address.rsplit_once(':') {
+            // An unbracketed host may not itself contain a colon: that would be
+            // an ambiguous IPv6 literal.
+            Some((host, port)) if !host.contains(':') => (host, port),
+            _ => return false,
+        }
+    };
+
+    !host.is_empty() && port.parse::<u16>().is_ok_and(|value| value > 0)
+}
+
 /// Validate email address format
 ///
 /// # Arguments
@@ -314,6 +357,36 @@ mod tests {
         assert_eq!(truncate_string("abcdef", 3), "abc");
         // Exactly at the character limit stays untouched.
         assert_eq!(truncate_string("你好世界", 4), "你好世界");
+    }
+
+    /// Host:port validation accepts the shapes peers actually use and rejects
+    /// the ambiguous ones.
+    #[test]
+    fn test_is_valid_host_port() {
+        // Accepted
+        assert!(is_valid_host_port("127.0.0.1:33445"));
+        assert!(is_valid_host_port("localhost:1"));
+        assert!(is_valid_host_port("tox.abilinski.com:3389"));
+        assert!(is_valid_host_port("[::1]:33445"));
+        assert!(
+            is_valid_host_port("  host:33445  "),
+            "surrounding space is trimmed"
+        );
+
+        // Rejected
+        assert!(!is_valid_host_port(""));
+        assert!(!is_valid_host_port("host"));
+        assert!(!is_valid_host_port(":33445"), "empty host");
+        assert!(!is_valid_host_port("host:"), "empty port");
+        assert!(!is_valid_host_port("host:0"), "port 0 is not dialable");
+        assert!(!is_valid_host_port("host:99999"), "port out of range");
+        assert!(!is_valid_host_port("host:abc"), "non numeric port");
+        assert!(!is_valid_host_port("::1:33445"), "unbracketed IPv6");
+        assert!(
+            !is_valid_host_port("[::1]33445"),
+            "missing bracket separator"
+        );
+        assert!(!is_valid_host_port("[::1]:"), "empty port after bracket");
     }
 
     #[tokio::test]
