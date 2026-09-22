@@ -87,7 +87,7 @@ x25519-dalek = "2.0"
 socket2 = "0.5"
 
 # Terminal UI (only the presentation engine links these)
-crossterm = "0.27"
+crossterm = "0.29"
 tui = "0.19"
 # Display width of text: the conversation pane wraps its own rows and the input
 # row places the caret by column, and both must measure a line the same way the
