@@ -25,11 +25,19 @@ By participating in this project you agree to abide by our
 git clone https://github.com/arkCyber/metaText.git
 cd metaText
 
-# Format, lint and test everything the way CI does
+# Format, lint, test and document everything the way CI does
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
-cargo test --all-features
+cargo clippy --all-targets --all-features --workspace -- -D warnings
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --workspace
 ```
+
+The code is split into the workspace crates described in the
+[README](README.md#workspace-layout): the dependency rules of §2.1 in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) are enforced by `Cargo.toml`, so
+put a module in the layer it belongs to rather than adding a dependency that
+points upwards. New user-visible wording belongs in `meta-text-tui`'s
+`presenter`/`text`, never in the backend.
 
 Build and run the default (light) profile:
 
@@ -64,13 +72,23 @@ cargo run --features sqlite,terminal-ui -- --mode cli
 - Unit tests live next to the code in `#[cfg(test)]` modules.
 - Integration tests live in [`tests/`](tests) and drive the public API or the
   compiled binary.
+- Runnable application cases live in [`examples/`](examples). `cargo test
+  --workspace` builds them and `cargo clippy --all-targets` lints them, so an
+  example that stops matching the public API breaks the build: keep them compiling
+  and add one when a new use of the public API appears.
 - Add a test for every bug fix and every new behaviour.
 - Keep tests hermetic: bind to port `0`, use `tempfile` for on-disk state, and
-  never depend on the network.
+  never depend on the network. Examples follow the same rule — a temporary data
+  directory, loopback addresses, and nothing written into the working tree.
+- **Never write into the working directory — including from a doc example.**
+  `cargo test` runs a crate's unit tests and its doc examples with the *package*
+  directory as the working directory, so an example that calls
+  `AppConfig::load("config.toml")` or `ensure_directory("logs")` leaves that file
+  behind in the source tree. Point it at `tempfile::tempdir()` instead.
 
 ```bash
-cargo test                       # default features
-cargo test --all-features        # everything, the CI configuration
+cargo test --workspace                  # default features, every crate
+cargo test --workspace --all-features   # everything, the CI configuration
 ```
 
 ## Commit messages
@@ -95,7 +113,8 @@ under 72 characters.
    `git checkout -b feat/my-change`.
 2. Make your change, add tests and documentation, and keep the diff focused.
 3. Ensure the full check suite passes locally:
-   `cargo fmt --all -- --check && cargo clippy --all-targets --all-features && cargo test --all-features`.
+   `cargo fmt --all -- --check && cargo clippy --all-targets --all-features --workspace -- -D warnings && cargo test --workspace --all-features && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --workspace`
+   (or `make ci`, which runs exactly those four).
 4. Update [`CHANGELOG.md`](CHANGELOG.md) under the `Unreleased` heading when the
    change is user-visible.
 5. Push the branch, open a pull request, and fill in the template. CI must be
