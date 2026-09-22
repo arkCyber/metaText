@@ -1,0 +1,40 @@
+[package]
+name = "meta-text-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["web3", "messaging", "tui", "terminal"]
+categories = ["command-line-interface"]
+description = "metaText presentation layer: the shared presenter and wording, the terminal rendering engine and the full screen front-end"
+
+[dependencies]
+# The contract this layer is written against.
+meta-text-core.workspace = true
+# Shared vocabulary (error, types, helpers).
+meta-text-proto.workspace = true
+
+# Async runtime
+tokio.workspace = true
+# Error handling
+anyhow.workspace = true
+# Logging
+tracing.workspace = true
+# Timestamps in the presenter and the status bar
+chrono.workspace = true
+
+# Terminal backend. Only this crate links these; a build without the feature
+# compiles the engine to a no-op console router.
+crossterm = { workspace = true, optional = true }
+tui = { workspace = true, optional = true }
+# Wrapping the conversation pane and placing the caret need the same measure the
+# widget uses, so a row is never wrapped twice.
+unicode-width = { workspace = true, optional = true }
+
+[features]
+default = []
+terminal-ui = ["crossterm", "tui", "unicode-width"]
+

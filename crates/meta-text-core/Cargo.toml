@@ -1,0 +1,42 @@
+[package]
+name = "meta-text-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["web3", "messaging", "actor", "service"]
+categories = ["network-programming"]
+description = "metaText core service: the headless actor that owns configuration, crypto, storage, transport and contacts, plus the in-process and TCP clients a front-end drives it with"
+
+[dependencies]
+# Wire contract and shared vocabulary.
+meta-text-proto.workspace = true
+# The subsystems the actor owns.
+meta-text-backend.workspace = true
+
+# Async runtime
+tokio.workspace = true
+# Error handling
+anyhow.workspace = true
+# Serialization (request queue diagnostics)
+serde.workspace = true
+serde_json.workspace = true
+# Logging
+tracing.workspace = true
+# Utilities the actor itself uses (hex payload encoding, ids, timestamps)
+hex.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[features]
+default = []
+# Persistence is configured in the command line / configuration file; the
+# driver itself is compiled in the backend crate, so this only forwards.
+sqlite = ["meta-text-backend/sqlite"]
+
+[dev-dependencies]
+tempfile.workspace = true
+

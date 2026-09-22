@@ -1,18 +1,41 @@
-[package]
-name = "meta-text"
+# =============================================================================
+# metaText workspace
+#
+# The dependency rules of the architecture document (docs/ARCHITECTURE.md §2.1)
+# are enforced by Cargo rather than by review: a crate can only reach what it
+# declares as a dependency, so the layering is checked by the compiler.
+#
+#   meta-text-proto    wire contract + shared vocabulary   (bottom)
+#     `- meta-text-backend   subsystems: crypto, storage, transports
+#          `- meta-text-core   the headless service (CoreService/CoreHandle)
+#               `- meta-text-tui   presentation: presenter + terminal engine
+#                    `- meta-text-cli   the line oriented REPL front-end
+#                         `- meta-text   this package: composition root + binary
+# =============================================================================
+
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.4.0"
 edition = "2021"
 authors = ["arkSong <arksong2018@gmail.com>"]
-description = "A Web3 decentralized instant messaging client built with Rust"
 license = "MIT"
 repository = "https://github.com/arkCyber/metaText"
 homepage = "https://github.com/arkCyber/metaText"
-documentation = "https://docs.rs/meta-text"
-readme = "README.md"
-keywords = ["web3", "messaging", "decentralized", "tox", "p2p"]
-categories = ["network-programming", "cryptography"]
 
-[dependencies]
+[workspace.dependencies]
+# Shared vocabulary and wire protocol.
+meta-text-proto = { path = "crates/meta-text-proto", version = "0.4.0" }
+# Subsystems and the transports that carry their bytes.
+meta-text-backend = { path = "crates/meta-text-backend", version = "0.4.0" }
+# The headless service a front-end is written against.
+meta-text-core = { path = "crates/meta-text-core", version = "0.4.0" }
+# Presentation: presenter, wording and the terminal rendering engine.
+meta-text-tui = { path = "crates/meta-text-tui", version = "0.4.0" }
+# Presentation: the line oriented REPL.
+meta-text-cli = { path = "crates/meta-text-cli", version = "0.4.0" }
+
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
 
@@ -35,44 +58,140 @@ clap = { version = "4.0", features = ["derive", "env"] }
 
 # Database
 # Database drivers are opt-in through the crate features below; the default
-# build only enables SQLite (see [features]). Enabling postgres/mysql here would
-# force all three drivers to be compiled unconditionally.
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls"], optional = true }
+# build enables none of them (every crate declares `default = []`), so a plain
+# build compiles no SQLx driver at all. Enabling one here only forwards it to the
+# layer that uses it; enabling postgres/mysql would additionally force all three
+# drivers to be compiled unconditionally.
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls"] }
 
 # Cryptography
 argon2 = "0.5"
 rand = "0.8"
 chacha20poly1305 = "0.10"
+# Per-contact key derivation: HKDF (RFC 5869) turns the session key into a distinct
+# key per contact pair, and SHA-256 is its hash. Both are already in the tree
+# (argon2 and sqlx pull them in), and they are small, audited crates.
+hkdf = "0.12"
+sha2 = "0.10"
+# Per-contact identity: the open half of A12 is a key agreement, and X25519
+# (RFC 7748) is what the architecture document names for it. The identity a peer
+# pins is therefore already the public key that handshake will take, so closing
+# A12 later is an addition rather than a change of what a fingerprint means.
+# `x25519-dalek` is the audited Rust implementation of the curve arithmetic.
+x25519-dalek = "2.0"
 
-# Network and Tox protocol
-tox = { version = "0.1.1", optional = true }
+# A raw socket is needed only to clear `IPV6_V6ONLY` on the TCP listener so that
+# one `[::]` socket accepts both families; `std` cannot set that option, and
+# without it an IPv6 wildcard is IPv6-only on Windows. Already in the tree as a
+# dependency of tokio.
+socket2 = "0.5"
 
-# Terminal UI
-crossterm = { version = "0.27", optional = true }
-tui = { version = "0.19", optional = true }
+# Terminal UI (only the presentation engine links these)
+crossterm = "0.27"
+tui = "0.19"
+# Display width of text: the conversation pane wraps its own rows and the input
+# row places the caret by column, and both must measure a line the same way the
+# widget does. Already in the tree as a dependency of `tui`.
+unicode-width = "0.1"
 
 # Utilities
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 dirs = "5.0"
-
 tempfile = "3.8"
 
-# NOTE: `criterion` was previously declared here but there are no benchmark
-# targets under `benches/`, and it pulled `is-terminal` which cannot be fetched
-# in an offline build. Re-add it together with a benchmark if needed.
+[package]
+name = "meta-text"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "A Web3 decentralized instant messaging client built with Rust"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/meta-text"
+readme = "README.md"
+keywords = ["web3", "messaging", "decentralized", "tox", "p2p"]
+categories = ["network-programming", "cryptography"]
+
+[lib]
+name = "meta_text"
+path = "src/lib.rs"
+
+[[bin]]
+name = "meta-text"
+path = "src/main.rs"
+
+# Runnable application cases, one per way the workspace is meant to be used:
+# embedding the core, attaching either front-end, two peers talking over TCP,
+# a front-end in another process, the identity/pin table, and the Tox transport.
+# `cargo test --workspace` builds them, so they double as a check that the public
+# API an application sees still compiles.
+[[example]]
+name = "embed_core"
+path = "examples/embed_core.rs"
+
+[[example]]
+name = "repl_session"
+path = "examples/repl_session.rs"
+
+[[example]]
+name = "tui_session"
+path = "examples/tui_session.rs"
+
+[[example]]
+name = "peer_chat"
+path = "examples/peer_chat.rs"
+
+[[example]]
+name = "remote_frontend"
+path = "examples/remote_frontend.rs"
+
+[[example]]
+name = "pin_identity"
+path = "examples/pin_identity.rs"
+
+# The Tox transport only exists with the feature; without it the example is
+# skipped rather than failing to compile.
+[[example]]
+name = "tox_transport"
+path = "examples/tox_transport.rs"
+required-features = ["tox-protocol"]
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+# Error handling
+anyhow.workspace = true
+# Logging and tracing
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+# CLI argument parsing
+clap.workspace = true
+# Utilities
+chrono.workspace = true
+
+# The workspace layers, in dependency order.
+meta-text-proto.workspace = true
+meta-text-backend.workspace = true
+meta-text-core.workspace = true
+meta-text-tui.workspace = true
+meta-text-cli.workspace = true
 
 [features]
 # Database drivers are opt-in: the default build stays light and does not
-# compile SQLx. Enable e.g. `--features sqlite` when persistence is needed.
+# compile SQLx (nor SQLite). Enable e.g. `--features sqlite` when persistence is
+# needed. The feature is forwarded to the layer that actually uses it.
 default = []
-sqlite = ["sqlx/sqlite"]
-postgres = ["sqlx/postgres"]
-mysql = ["sqlx/mysql"]
-tox-protocol = ["tox"]
-terminal-ui = ["crossterm", "tui"]
+sqlite = ["meta-text-backend/sqlite", "meta-text-core/sqlite"]
+postgres = ["meta-text-backend/postgres"]
+mysql = ["meta-text-backend/mysql"]
+tox-protocol = ["meta-text-backend/tox-protocol"]
+terminal-ui = ["meta-text-tui/terminal-ui"]
 
-# Make this package its own workspace root so the directory can be published as
-# a standalone repository (independent of any enclosing workspace).
-[workspace]
+[dev-dependencies]
+tempfile.workspace = true
+
+

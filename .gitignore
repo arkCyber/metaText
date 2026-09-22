@@ -18,6 +18,12 @@ metatext-session.json
 *.db-wal
 logs/
 *.log
+# Tox transport state: `toxcore`'s identity/friend list and the transport's own
+# durable queue. Both live in the data directory, which is only a checkout when
+# it is passed as `--data-dir .`.
+tox-savedata.bin
+tox-state.json
+tox-state.tmp
 
 # ---- Environment / secrets -------------------------------------------------
 .env
@@ -32,3 +38,9 @@ logs/
 *.swp
 *.swo
 *~
+
+# ---- Python (the terminal suite under scripts/) ----------------------------
+# `scripts/tui-e2e` is imported by its phase scripts, which leaves bytecode next
+# to the sources.
+__pycache__/
+*.py[cod]

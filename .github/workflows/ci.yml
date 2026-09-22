@@ -38,9 +38,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Lint
-        # The crate enables pedantic/nursery/cargo lints as warnings; CI keeps
-        # them visible without failing on pre-existing warnings.
-        run: cargo clippy --all-targets --all-features --workspace
+        # Warnings are errors here: the crates enable `clippy::pedantic`,
+        # `clippy::nursery` and the panic-family lints (`unwrap_used`,
+        # `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`), so this
+        # step is the gate that keeps them from accumulating. Unit tests are exempt
+        # through a `cfg(test)` allow, because a test may assert by unwrapping.
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -54,11 +57,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build (default features)
-        run: cargo build --verbose
+        run: cargo build --workspace --verbose
       - name: Test (default features)
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
       - name: Test (all features)
-        run: cargo test --all-features --verbose
+        run: cargo test --workspace --all-features --verbose
+
+  tui-e2e:
+    name: terminal suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Drive the full screen interface on a pty
+        # The crate tests cover the pieces that are pure functions; this suite
+        # covers what only a terminal can show - the alternate screen, the pane
+        # layout, the line editor, every command, and two peers exchanging frames
+        # while the interface draws what arrives. It builds the binary with
+        # `terminal-ui` itself, because `cargo test` relinks it without the feature
+        # and `--mode tui` then falls back to the line oriented REPL.
+        run: make tui-e2e
 
   docs:
     name: docs

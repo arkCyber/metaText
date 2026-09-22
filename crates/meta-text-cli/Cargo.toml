@@ -1,0 +1,34 @@
+[package]
+name = "meta-text-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["web3", "messaging", "cli", "repl"]
+categories = ["command-line-interface"]
+description = "metaText line oriented REPL front-end: reads stdin on a bounded queue and renders core replies and events through the shared presenter"
+
+[dependencies]
+# The contract this layer is written against.
+meta-text-core.workspace = true
+# Shared vocabulary (error, types, helpers).
+meta-text-proto.workspace = true
+# The shared presenter and the console output routing it renders through.
+meta-text-tui.workspace = true
+
+# Async runtime
+tokio.workspace = true
+# Error handling
+anyhow.workspace = true
+# Logging
+tracing.workspace = true
+
+[features]
+default = []
+# Forwarded so `--features terminal-ui` can be given to this crate directly and
+# still reach the engine that owns the terminal backend.
+terminal-ui = ["meta-text-tui/terminal-ui"]
+

@@ -211,7 +211,10 @@ check_documentation_completeness = true
 
 [project_structure]
 # Directory structure
+# The crate the binary belongs to lives at the root; every layer of
+# docs/ARCHITECTURE.md §2.1 is a crate under `crates/`.
 src_dir = "src/"
+workspace_dir = "crates/"
 test_dir = "tests/"
 bench_dir = "benches/"
 doc_dir = "docs/"

@@ -1,0 +1,45 @@
+[package]
+name = "meta-text-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["web3", "messaging", "protocol", "serde"]
+categories = ["network-programming"]
+description = "metaText wire protocol: the versioned request/reply/event vocabulary, its framing and boundary validation, plus the shared error, type and helper vocabulary every other layer is built on"
+
+[dependencies]
+# Shared vocabulary
+chrono.workspace = true
+hex.workspace = true
+rand.workspace = true
+uuid.workspace = true
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+# Error handling
+thiserror.workspace = true
+# `MetaTextError::Database` wraps the driver's error, so the opt-in drivers are
+# forwarded here as features.
+sqlx = { workspace = true, optional = true }
+# Framing runs on tokio's async I/O traits
+tokio.workspace = true
+# Logging
+tracing.workspace = true
+
+[features]
+# Database drivers are opt-in; the feature only decides whether
+# `MetaTextError` can wrap that driver's error.
+default = []
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+mysql = ["sqlx/mysql"]
+
+[dev-dependencies]
+# The `utils` examples return `anyhow::Result` the way the binary does.
+anyhow.workspace = true
+tempfile.workspace = true
+

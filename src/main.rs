@@ -34,8 +34,36 @@
     clippy::all,
     clippy::pedantic,
     clippy::nursery,
-    clippy::cargo,
+    // `clippy::cargo` minus `multiple_crate_versions`: the duplicate
+    // `wasi`/`getrandom` versions arrive transitively (SQLx and uuid pin
+    // different majors) and are unreachable from our code, so the lint only
+    // reports a dependency's choice. The metadata lints stay on — they are what
+    // caught the member crates' missing README/keywords/categories.
+    clippy::cargo_common_metadata,
+    clippy::negative_feature_names,
+    clippy::redundant_feature_names,
+    clippy::wildcard_dependencies,
+    // Panic-prone constructs are rejected in the shipped paths: a fault travels as
+    // an error value, not as an unwind, because a front end that panics takes the
+    // session (and the user's terminal) with it. CI turns warnings into errors, so
+    // this list is a gate rather than a suggestion.
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::unwrap_used,
     rust_2018_idioms
+)]
+// A test may assert by unwrapping: the gate above guards the shipped paths.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
 )]
 
 use anyhow::{bail, Context, Result};
@@ -43,12 +71,32 @@ use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use meta_text::cli::{AppMode, CliArgs, LogLevel};
+use meta_text::cli::{AppMode, CliArgs, LogLevel, Transport};
 use meta_text::config::AppConfig;
 use meta_text::ipc::client::LocalClient;
 use meta_text::ipc::server::{CoreServer, ServerOptions};
 use meta_text::ipc::{CoreHandle, CoreService};
+use meta_text::tui::{Theme, UiOptions};
 use meta_text::ui::{CliFrontend, TuiFrontend};
+
+/// Translate the `[ui]` section into the preferences the interface honours.
+///
+/// The naming differs on purpose: the configuration describes what a user asked
+/// for, while [`UiOptions`] is the smaller set of decisions the presentation layer
+/// actually makes. `message_format` is not among them — the configuration refuses a
+/// value it cannot keep rather than accepting it here and ignoring it.
+fn ui_options(ui: &meta_text::config::UiConfig) -> UiOptions {
+    UiOptions {
+        colors: ui.enable_colors,
+        theme: if ui.theme.trim().eq_ignore_ascii_case("light") {
+            Theme::Light
+        } else {
+            Theme::Dark
+        },
+        mouse: ui.enable_mouse,
+        auto_scroll: ui.auto_scroll,
+    }
+}
 
 /// Main entry point for the metaText application.
 ///
@@ -123,7 +171,22 @@ async fn main() -> Result<()> {
         args.config_path
     );
 
+    // The transport is chosen by the core itself, so every front-end works the
+    // same way over TCP and Tox: `--transport tox` only changes which transport
+    // `CoreService` builds.
+    if !matches!(args.transport, Transport::Tcp | Transport::Tox) {
+        bail!("unsupported transport: {}", args.transport);
+    }
+
     // Build and start the backend, then detach it onto its own task.
+    // The endpoint policy is copied out first: the core takes ownership of the
+    // configuration, and a headless run needs the `[ipc]` section afterwards.
+    let ipc = config.ipc.clone();
+    // The presentation layer is written against the core protocol, so the `[ui]`
+    // settings it honours are translated here, before the configuration is handed
+    // to the core: the composition root is the only place that knows both.
+    let ui_options = ui_options(&config.ui);
+
     let mut service = CoreService::new(config, args.clone())
         .await
         .context("Failed to create the core service")?;
@@ -137,7 +200,7 @@ async fn main() -> Result<()> {
         timestamp.format("%Y-%m-%d %H:%M:%S")
     );
 
-    match run_interface(&core, &args, mode, &app_name).await {
+    match run_interface(&core, &args, mode, &app_name, &ipc, ui_options).await {
         Ok(()) => {
             info!(
                 "👋 [{}] MetaText application shutdown gracefully",
@@ -162,14 +225,14 @@ async fn run_interface(
     args: &CliArgs,
     mode: AppMode,
     app_name: &str,
+    ipc: &meta_text::config::IpcConfig,
+    ui_options: UiOptions,
 ) -> Result<()> {
     let client = LocalClient::new(core.clone());
 
     match mode {
-        // Headless modes never touch the terminal.
-        AppMode::Server | AppMode::Daemon | AppMode::Core => run_headless(core, args).await,
         AppMode::Tui if !args.headless => {
-            let mut frontend = TuiFrontend::start(client, app_name, true)
+            let mut frontend = TuiFrontend::start(client, app_name, true, ui_options)
                 .await
                 .context("Failed to start the terminal interface")?;
             frontend.run().await
@@ -178,8 +241,9 @@ async fn run_interface(
             let mut frontend = CliFrontend::new(client);
             frontend.run().await
         }
-        // `--headless` (and every remaining combination) hosts the backend.
-        _ => run_headless(core, args).await,
+        // The headless modes (`server`, `daemon`, `core`) never touch the
+        // terminal, and `--headless` routes every other mode here as well.
+        _ => run_headless(core, args, ipc).await,
     }
 }
 
@@ -188,23 +252,46 @@ async fn run_interface(
 /// When `--ipc-listen` is given the core protocol is exposed on that address so
 /// other front-ends can attach; otherwise the process simply idles until it
 /// receives SIGINT or SIGTERM.
-async fn run_headless(core: &CoreHandle, args: &CliArgs) -> Result<()> {
+async fn run_headless(
+    core: &CoreHandle,
+    args: &CliArgs,
+    ipc: &meta_text::config::IpcConfig,
+) -> Result<()> {
     let server = match args.ipc_listen.as_deref() {
         Some(address) => {
+            // An exposed endpoint must be authenticated. Loopback is a local
+            // trust decision; anything else without a token would let any host
+            // on the network drive the backend.
+            if args.ipc_token.is_none() && !meta_text::utils::is_loopback_host(address) {
+                bail!(
+                    "--ipc-listen {address} is not a loopback address and no --ipc-token was \
+                     given: refusing to expose an unauthenticated core endpoint"
+                );
+            }
+
             let endpoint = CoreServer::bind(address)
                 .await
                 .with_context(|| format!("Failed to bind the core protocol to {address}"))?;
             if let Ok(local) = endpoint.local_addr() {
                 info!("🛰️ Core protocol endpoint bound to {local}");
             }
+            // The policy comes from `[ipc]`, with the flags as per-run overrides:
+            // the file is where an operator changes it, the flag is what a one-off
+            // `--ipc-listen` uses.
             let options = ServerOptions {
                 token: args.ipc_token.clone(),
-                name: "meta-text".to_string(),
+                requests_per_second: args.ipc_rate.unwrap_or(ipc.requests_per_second),
+                request_burst: args.ipc_burst.unwrap_or(ipc.request_burst),
+                ..ServerOptions::default()
             };
+            info!(
+                "🚦 Serving at most {} request(s)/s per client address (burst {})",
+                options.requests_per_second, options.request_burst
+            );
             if options.token.is_none() {
                 warn!(
-                    "⚠️ --ipc-listen without --ipc-token: any local process can attach. \
-                     Prefer a loopback address or set a token."
+                    "⚠️ --ipc-listen on a loopback address without --ipc-token: \
+                     any local process can attach"
                 );
             }
             let owned = core.clone();
@@ -291,8 +378,6 @@ fn init_logging(
     cli_level: Option<LogLevel>,
     console: bool,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    use std::path::{Path, PathBuf};
-
     // Precedence: `RUST_LOG`, then an explicit `--log-level` / `--debug`, then
     // `[logging] level`, then the built-in default.
     let configured = cli_level
@@ -305,28 +390,13 @@ fn init_logging(
 
     // --- optional file layer -------------------------------------------------
     let (file_layer, guard) = if config.enable_file {
-        // Split the configured path into a directory and a file name prefix,
-        // because the rolling appender derives `{prefix}.{date}` itself.
-        let path = Path::new(config.file_path.trim());
-        let directory = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
-        let prefix = path.file_name().map_or_else(
-            || "meta-text.log".to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-
-        let mut builder = tracing_appender::rolling::RollingFileAppender::builder()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix(prefix);
-        if config.max_files > 0 {
-            // `0` would mean "delete everything"; the validator rejects it, and
-            // this guard keeps the appender safe even if it is bypassed.
-            builder = builder.max_log_files(config.max_files);
-        }
-
-        let appender = builder.build(&directory).with_context(|| {
+        // `rotation_size_mb` is enforced by the writer rather than accepted and
+        // ignored: `tracing_appender`'s rolling appender rotates by time only.
+        let (mut appender, directory) = meta_text::logging::file_writer(config);
+        // Open the first file eagerly: `non_blocking` swallows write errors into its
+        // own thread, so a log directory that cannot be created would otherwise lose
+        // every line silently. This turns it into a startup error naming the path.
+        appender.open().with_context(|| {
             format!("Failed to open the log file under {}", directory.display())
         })?;
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
@@ -360,14 +430,9 @@ fn init_logging(
     );
     if config.enable_file {
         info!(
-            "📁 Log files are written as {}.YYYY-MM-DD (keeping {} file(s))",
-            config.file_path, config.max_files
+            "📁 Log files are written as {}.YYYY-MM-DD (rolling at {} MB, keeping {} file(s))",
+            config.file_path, config.rotation_size_mb, config.max_files
         );
-    }
-    // Note: `rotation_size_mb` is accepted for forward compatibility but not
-    // enforced, because the appender rotates by time only.
-    if config.rotation_size_mb != 10 {
-        info!("ℹ️ logging.rotation_size_mb is not enforced by the time based appender");
     }
 
     // Hand the guard back to the caller so that it lives for the whole process.
@@ -386,8 +451,10 @@ mod tests {
         // Note: In real tests, we might want to use a test-specific logging setup
         // to avoid interfering with other tests. File logging is disabled here so
         // the test does not depend on the working directory being writable.
-        let mut config = LoggingConfig::default();
-        config.enable_file = false;
+        let config = LoggingConfig {
+            enable_file: false,
+            ..LoggingConfig::default()
+        };
 
         let _guard = init_logging(&config, Some(LogLevel::Info), false)
             .context("Logging initialization should succeed")?;
@@ -416,12 +483,13 @@ mod tests {
         let valid = CliArgs::try_parse_from(["meta-text", "--mode", "cli"]).expect("valid args");
         assert!(valid.validate().is_ok());
 
-        // Port 0 is rejected by validation.
-        let invalid = CliArgs::try_parse_from(["meta-text", "--port", "0"]).expect("parses");
-        let errors = invalid.validate().expect_err("port 0 must be rejected");
-        assert!(errors
-            .iter()
-            .any(|error| error.contains("Port cannot be 0")));
+        // Port 0 is the documented "let the OS pick a free port" case.
+        let ephemeral = CliArgs::try_parse_from(["meta-text", "--port", "0"]).expect("parses");
+        assert!(ephemeral.validate().is_ok());
+        assert_eq!(ephemeral.port, Some(0));
+
+        // A port outside `u16` is refused by the parser itself.
+        assert!(CliArgs::try_parse_from(["meta-text", "--port", "70000"]).is_err());
 
         // An unknown mode cannot be parsed at all.
         assert!(CliArgs::try_parse_from(["meta-text", "--mode", "nope"]).is_err());

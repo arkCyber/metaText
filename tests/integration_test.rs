@@ -15,12 +15,15 @@
 use std::sync::Arc;
 
 use meta_text::cli::CliArgs;
-use meta_text::config::{AppConfig, CryptoConfig, DatabaseConfig, NetworkConfig};
+use meta_text::config::{
+    AppConfig, CryptoConfig, DatabaseConfig, NetworkConfig, DEFAULT_KEEPALIVE_INTERVAL,
+};
 use meta_text::crypto::{CryptoManager, KEY_LENGTH};
 use meta_text::database::DatabaseManager;
 use meta_text::ipc::{CoreClient, CoreService, Request};
 use meta_text::network::NetworkManager;
-use meta_text::types::AppState;
+use meta_text::trust::PinStore;
+use meta_text::types::{AppState, ContentType, MessageKind};
 
 /// A configuration with a loopback network port and a temporary database file
 fn test_config(db_path: &std::path::Path) -> AppConfig {
@@ -68,13 +71,14 @@ async fn test_network_lifecycle() {
         bootstrap_nodes: vec![],
         connection_timeout: 1,
         max_connections: 8,
+        keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
         enable_upnp: false,
         enable_ipv6: false,
     };
 
     let crypto = Arc::new(CryptoManager::new(&CryptoConfig::default()).await.unwrap());
     let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(1024);
-    let mut manager = NetworkManager::new(&config, crypto, event_sender)
+    let mut manager = NetworkManager::new(&config, crypto, event_sender, PinStore::volatile())
         .await
         .unwrap();
 
@@ -100,6 +104,7 @@ async fn test_peers_exchange_messages_end_to_end() {
         bootstrap_nodes: vec![],
         connection_timeout: 5,
         max_connections: 8,
+        keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
         enable_upnp: false,
         enable_ipv6: false,
     };
@@ -109,7 +114,9 @@ async fn test_peers_exchange_messages_end_to_end() {
             Arc::new(Crypto::from_passphrase(&CryptoConfig::default(), passphrase).unwrap());
         let (sender, receiver) = tokio::sync::mpsc::channel(1024);
         (
-            NetworkManager::new(&config, crypto, sender).await.unwrap(),
+            NetworkManager::new(&config, crypto, sender, PinStore::volatile())
+                .await
+                .unwrap(),
             receiver,
         )
     };
@@ -118,7 +125,9 @@ async fn test_peers_exchange_messages_end_to_end() {
             Arc::new(Crypto::from_passphrase(&CryptoConfig::default(), passphrase).unwrap());
         let (sender, receiver) = tokio::sync::mpsc::channel(1024);
         (
-            NetworkManager::new(&config, crypto, sender).await.unwrap(),
+            NetworkManager::new(&config, crypto, sender, PinStore::volatile())
+                .await
+                .unwrap(),
             receiver,
         )
     };
@@ -129,7 +138,12 @@ async fn test_peers_exchange_messages_end_to_end() {
     let alice_addr = alice.local_addr().unwrap();
     bob.connect(&alice_addr.to_string()).await.unwrap();
 
-    assert_eq!(bob.broadcast(b"integration hello").unwrap().peers, 1);
+    assert_eq!(
+        bob.broadcast(b"integration hello", MessageKind::Text, ContentType::Text)
+            .unwrap()
+            .peers,
+        1
+    );
 
     // Handshake events (peer connected) may arrive before the message.
     let payload = loop {
@@ -159,7 +173,11 @@ async fn test_database_lifecycle() {
             .to_string_lossy()
             .to_string(),
         max_connections: 2,
-        enable_migrations: false,
+        // Migrations on: `false` is only accepted for a database whose schema already
+        // exists, and this file is created by the test itself. The refusal for a
+        // schema-less database is covered by
+        // `database::tests::test_disabled_migrations_require_a_prepared_schema`.
+        enable_migrations: true,
     };
 
     let mut manager = DatabaseManager::new(&config).await.unwrap();
@@ -197,6 +215,8 @@ async fn test_sqlite_history_survives_restart() {
                 "Alice",
                 "hello from the first session",
                 27,
+                MessageKind::Text,
+                ContentType::Text,
             ))
             .await
             .unwrap();
@@ -222,7 +242,15 @@ async fn test_sqlite_history_survives_restart() {
 async fn test_core_service_initialization_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(&dir.path().join("meta-text.db"));
-    let args = CliArgs::default();
+    // The session snapshot lives next to `--data-dir`, so the test must pin it
+    // to the temporary directory too. With `CliArgs::default()` the core would
+    // fall back to the per-user data directory and the test would both read the
+    // developer's real session (making `contacts.is_empty()` state dependent)
+    // and write its throwaway contact back into it.
+    let args = CliArgs {
+        data_dir: Some(dir.path().to_path_buf()),
+        ..CliArgs::default()
+    };
 
     let service = CoreService::new(config, args).await;
     assert!(service.is_ok(), "the core service must initialise");

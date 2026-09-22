@@ -1,0 +1,74 @@
+[package]
+name = "meta-text-backend"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["web3", "messaging", "p2p", "encryption", "sqlite"]
+categories = ["network-programming", "cryptography"]
+description = "metaText subsystems: authenticated encryption, SQL persistence, the peer-to-peer TCP transport and the Tox transport, plus the configuration, logging and command line vocabulary they share"
+
+[dependencies]
+# Shared vocabulary and the wire protocol.
+meta-text-proto.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging and tracing
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+# Command line vocabulary (the parsed arguments the core is configured with)
+clap.workspace = true
+
+# Database
+sqlx = { workspace = true, optional = true }
+
+# Cryptography
+argon2.workspace = true
+rand.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+
+# IPv6 dual stack listener
+socket2.workspace = true
+
+# Utilities
+uuid.workspace = true
+chrono.workspace = true
+hex.workspace = true
+dirs.workspace = true
+
+[features]
+# Database drivers are opt-in: the default build stays light and does not
+# compile SQLx. Enable e.g. `--features sqlite` when persistence is needed. The
+# feature is also forwarded to `meta-text-proto`, whose shared error type wraps
+# the driver's error.
+default = []
+sqlite = ["sqlx/sqlite", "meta-text-proto/sqlite"]
+postgres = ["sqlx/postgres", "meta-text-proto/postgres"]
+mysql = ["sqlx/mysql", "meta-text-proto/mysql"]
+# Hand written FFI bindings to the system `libtoxcore`. The pure-Rust `tox`
+# crate is intentionally NOT used: it is GPL-3.0+, pinned to tokio 0.2 and only
+# exposes low-level DHT/net_crypto primitives without a client API.
+tox-protocol = []
+
+[dev-dependencies]
+tempfile.workspace = true
+

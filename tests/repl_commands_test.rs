@@ -15,10 +15,12 @@
  * setup, the stdin reader, the event loop and graceful shutdown together.
  */
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Path to the binary under test, provided by Cargo.
@@ -166,6 +168,57 @@ fn assert_contains_any(haystack: &str, needles: &[&str], context: &str) {
     );
 }
 
+/// Assert that `needle` occurs at least `at_least` times.
+///
+/// Used where the same sentence is the correct answer to two different commands
+/// (a transport that cannot host groups answers both `/group` and
+/// `/group invites` with it), so "is it present" cannot tell whether the second
+/// command was dispatched at all.
+fn assert_occurrences_at_least(haystack: &str, needle: &str, at_least: usize, context: &str) {
+    let found = haystack.matches(needle).count();
+    assert!(
+        found >= at_least,
+        "{context}: expected {needle:?} at least {at_least} time(s), found {found}\n\
+         ----- stdout -----\n{haystack}\n------------------"
+    );
+}
+
+/// An unauthenticated bind on a non-loopback address is refused at startup, so
+/// the backend cannot be exposed to the network by accident.
+#[test]
+fn test_non_loopback_endpoint_requires_a_token() {
+    let port = free_port();
+    let address = format!("0.0.0.0:{port}");
+
+    let (refused, _dir) = run_session(
+        &[
+            "--mode",
+            "core",
+            "--headless",
+            "--ipc-listen",
+            address.as_str(),
+        ],
+        "",
+        Duration::from_secs(20),
+    );
+    assert_ne!(
+        refused.code,
+        Some(0),
+        "the process must refuse to start: {}",
+        refused.combined()
+    );
+    assert_contains(
+        &refused.combined(),
+        "refusing to expose an unauthenticated core endpoint",
+        "non-loopback refusal",
+    );
+    assert_contains(
+        &refused.combined(),
+        "--ipc-token",
+        "non-loopback refusal must name the flag",
+    );
+}
+
 /// One scripted session that walks through every interactive command.
 ///
 /// The order matters: contacts are added before `/chat`/`/msg`, and removed
@@ -189,6 +242,22 @@ const FULL_SCRIPT: &str = "\
 /peers\n\
 /connections\n\
 /stats\n\
+/metrics\n\
+/help /metrics\n\
+/help /bin\n\
+/bin\n\
+/bin 00ff10\n\
+/requests\n\
+/accept 1\n\
+/reject 1\n\
+/reject\n\
+/group\n\
+/group invites\n\
+/group bogus\n\
+/group create Team\n\
+/group rename Team2\n\
+/group rename\n\
+/help /group\n\
 /history\n\
 /log 5\n\
 /clear\n\
@@ -257,7 +326,8 @@ fn test_run_executes_all_repl_commands() {
     assert_contains(stdout, "metaText status", "/info banner");
     assert_contains(stdout, "mode            : CLI", "/info mode");
     assert_contains(stdout, "metaText identity", "/whoami");
-    assert_contains(stdout, "  DID      : ", "/whoami DID");
+    assert_contains(stdout, "  identity : ", "/whoami identity");
+    assert_contains(stdout, "  fingerprint: ", "/whoami fingerprint");
     assert_contains(
         stdout,
         "metaText v0.4.0 (encryption: ChaCha20-Poly1305)",
@@ -278,6 +348,73 @@ fn test_run_executes_all_repl_commands() {
 
     // Statistics and history (wording depends on the `sqlite` feature).
     assert_contains(stdout, "Runtime statistics:", "/stats");
+    // `/metrics` is a scriptable key=value block, and `/help metrics` documents it.
+    assert_contains(stdout, "metaText metrics", "/metrics banner");
+    assert_contains(stdout, "  transport=tcp", "/metrics transport");
+    assert_contains(stdout, "  request_queue_depth=", "/metrics queue depth");
+    assert_contains(
+        stdout,
+        "  request_queue_capacity=",
+        "/metrics queue capacity",
+    );
+    assert_contains(stdout, "  payloads_dropped=", "/metrics sheds");
+    assert_contains(stdout, "  event_subscribers=", "/metrics subscribers");
+    assert_contains(
+        stdout,
+        "Show operational counters as key=value lines",
+        "/help /metrics",
+    );
+    // Inside that block the actor-lag and shed counters are visible.
+    assert_contains(stdout, "  request_wait_max_us=", "/metrics actor lag");
+    assert_contains(stdout, "  requests_served=", "/metrics served count");
+
+    // `/bin` takes hexadecimal and refuses an empty body with a usage line.
+    assert_contains(stdout, "Usage: /bin <hexadecimal>", "/bin usage");
+    assert_contains(stdout, "Send an opaque binary payload", "/help /bin");
+
+    // All three friend-request commands exist on Tox only, and each says so (the
+    // capability is checked before the pending list is consulted, so the answer is
+    // not the misleading "no pending request #1"). Three commands produce the same
+    // sentence, so the count is what says each one ran; a missing target is caught
+    // even earlier, before the transport is considered at all.
+    assert_occurrences_at_least(
+        stdout,
+        "friend requests only exist on the Tox transport",
+        3,
+        "/requests, /accept and /reject on tcp",
+    );
+    assert_contains(stdout, "Usage: /reject", "/reject without a target");
+    // The transport-level refusal (which names the transport) is asserted at the
+    // core interface in core_service_test, where no front-end filters it first.
+    assert!(
+        !stdout.contains("no pending request #1"),
+        "/requests on tcp: a capability hint must not be replaced by an index error\n\
+         ----- stdout -----\n{stdout}\n------------------"
+    );
+
+    // `/group` reports that this transport cannot host groups, an unknown
+    // subcommand is named as such, and the topic help lists the subcommands.
+    assert_contains(stdout, "the tcp transport has no groups", "/group on tcp");
+    // `/group invites` and `/group rename <name>` are dispatched and answer the
+    // same way on this transport (the capability refusal is checked before the
+    // group is looked up, so it names the remedy rather than "no such group"), so
+    // the count is the signal that all three commands ran.
+    assert_occurrences_at_least(
+        stdout,
+        "the tcp transport has no groups",
+        3,
+        "/group, /group invites and /group rename on tcp",
+    );
+    assert_contains(stdout, "unknown /group subcommand '/bogus'", "/group bogus");
+    assert_contains(stdout, "Group chats (Tox only)", "/help /group");
+    // A refused group request must not look like a success, and a rename without a
+    // name is refused by the front-end before it reaches the core at all.
+    assert_contains(stdout, "could not create a group", "/group create on tcp");
+    assert_contains(
+        stdout,
+        "Usage: /group rename",
+        "/group rename without a name",
+    );
     assert_contains_any(
         stdout,
         &["message history is not available", "no stored messages yet"],
@@ -431,6 +568,37 @@ fn test_tui_falls_back_to_repl_when_not_a_terminal() {
     );
 }
 
+/// The fallback reader exits on `/quit` while stdin stays open.
+///
+/// Both the plain REPL and this reader used to read through `tokio::io::stdin()`,
+/// whose blocking read is not cancellable and is waited on when the runtime is
+/// dropped: the process stayed alive after `/quit` whenever stdin was still open.
+/// A one-shot script never noticed, because closing stdin (EOF) ends the read.
+/// This keeps the pipe open on purpose and asserts the exit code, which is what
+/// the fix is for.
+#[test]
+fn test_tui_fallback_quits_with_stdin_open() {
+    let mut instance = RunningInstance::spawn(&["--mode", "tui"]);
+    assert!(
+        instance.wait_for(
+            "Type `/help` to get metaText command list.",
+            Duration::from_secs(20)
+        ),
+        "the fallback REPL must start (said: {})",
+        instance.written()
+    );
+
+    instance.write_line("/quit");
+    let code = instance.wait_for_exit(Duration::from_secs(10));
+    let out = instance.shutdown();
+    assert_eq!(
+        code,
+        Some(0),
+        "the fallback must exit on /quit with stdin still open (said: {})",
+        out.combined()
+    );
+}
+
 /// `--headless` starts the subsystems but never reads stdin or shows the REPL
 #[test]
 fn test_headless_suppresses_repl() {
@@ -457,20 +625,65 @@ fn test_headless_suppresses_repl() {
     );
 }
 
+/// `--port 0` means "let the OS pick a free port", end to end.
+///
+/// The value is documented (README, `--help`, `config.toml`) and the bound port is
+/// what `/peers` and `/whoami` report — which is what makes it usable rather than a
+/// guess. This asserts both halves in the compiled binary: the session starts, and
+/// the port it reports is a real one.
+#[test]
+fn test_port_zero_starts_and_reports_the_bound_port() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::copy(config_template(), &config_path).expect("copy config");
+    let data_dir = dir.path().join("data");
+
+    // `hermetic_args` always appends `--port <free port>`, and clap refuses a flag
+    // given twice, so the arguments are built by hand here.
+    let args = vec![
+        "run".to_string(),
+        "--config".to_string(),
+        config_path.to_string_lossy().into_owned(),
+        "--data-dir".to_string(),
+        data_dir.to_string_lossy().into_owned(),
+        "--port".to_string(),
+        "0".to_string(),
+        "--log-level".to_string(),
+        "error".to_string(),
+    ];
+    let outcome = execute(
+        &args,
+        Some("/whoami\n/quit\n"),
+        dir.path(),
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "port 0 must start\n{}",
+        outcome.combined()
+    );
+
+    // `/whoami` prints `  address  : [::]:<port>`.
+    let address_line = outcome
+        .stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("address  :"))
+        .unwrap_or_else(|| panic!("no address line in\n{}", outcome.stdout));
+    let (_, port) = address_line
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("no port in {address_line:?}"));
+    let port: u16 = port
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("no numeric port in {address_line:?}"));
+    assert_ne!(port, 0, "the OS must assign a real port: {address_line}");
+}
+
 /// Invalid command line arguments are rejected before the app starts
 #[test]
 fn test_run_rejects_invalid_arguments() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    // Port 0 is rejected.
-    let port_zero = execute(
-        &["run".to_string(), "--port".to_string(), "0".to_string()],
-        None,
-        manifest,
-        Duration::from_secs(10),
-    );
-    assert_ne!(port_zero.code, Some(0), "port 0 must fail");
-    assert_contains(&port_zero.combined(), "Port cannot be 0", "port 0");
 
     // A malformed peer address is rejected.
     let bad_peer = execute(
@@ -559,10 +772,88 @@ fn test_message_length_limit_is_enforced() {
     assert_contains(&outcome.stdout, "messages sent     : 0", "no message sent");
 }
 
+/// `/me` sends a third-person action that the peer renders as an action.
+///
+/// Input is written line by line rather than in one script, so the handshake has
+/// time to finish before a peer is addressed; the assertion is then about
+/// delivery, not about the offline queue.
+#[test]
+fn test_me_action_is_sent_and_rendered() {
+    let passphrase = "repl-e2e-action";
+    let alice = RunningInstance::spawn(&["run", "--nick", "Alice", "--passphrase", passphrase]);
+    std::thread::sleep(Duration::from_millis(700));
+
+    let peer = format!("127.0.0.1:{}", alice.port);
+    let mut bob = RunningInstance::spawn(&[
+        "run",
+        "--nick",
+        "Bob",
+        "--passphrase",
+        passphrase,
+        "--peer",
+        peer.as_str(),
+    ]);
+
+    // Let the dial and the nickname exchange complete. The wait also covers the
+    // transport supervisor's reconnect interval, in case Alice was not listening
+    // yet when Bob's first dial went out.
+    std::thread::sleep(Duration::from_millis(3000));
+    bob.write_line("/add Alice");
+    bob.write_line("/chat 1");
+    assert!(
+        bob.wait_for("now chatting with #1 Alice", Duration::from_secs(20)),
+        "Bob must select the conversation before addressing her:\n{}",
+        bob.written()
+    );
+    bob.write_line("/me waves at Alice");
+
+    // The sender renders the action the way the peer will see it.
+    assert!(
+        bob.wait_for("→ Alice: * Bob waves at Alice", Duration::from_secs(10)),
+        "action send (bob said: {})",
+        bob.written()
+    );
+
+    // ...and the peer prints it as an action, not as a chat line. Waiting for the
+    // line instead of sleeping for a guessed duration keeps this deterministic on
+    // a loaded machine.
+    assert!(
+        alice.wait_for("* Bob waves at Alice", Duration::from_secs(10)),
+        "action received (bob said: {})",
+        bob.written()
+    );
+
+    bob.write_line("/quit");
+    let bob_out = bob.shutdown();
+    let alice_out = alice.shutdown();
+
+    assert_contains(
+        &bob_out.stdout,
+        "→ Alice: * Bob waves at Alice",
+        &format!("action send (bob said: {})", bob_out.combined()),
+    );
+    assert_contains(
+        &alice_out.stdout,
+        "* Bob waves at Alice",
+        &format!("action received (alice said: {})", alice_out.combined()),
+    );
+    assert!(
+        !alice_out.stdout.contains("📥 Bob: waves at Alice"),
+        "an action must not be rendered as a chat message:\n{}",
+        alice_out.stdout
+    );
+}
+
 /// A long-lived `run` instance used to exercise the real transport.
 ///
 /// Its stdin pipe is left open (no data written), so the REPL never sees EOF
 /// and the process keeps running until it is killed.
+///
+/// A reader thread mirrors stdout into [`RunningInstance::stdout`] as it is
+/// written, so a test can *wait for* a line instead of sleeping for a while and
+/// hoping. That is what makes these end-to-end tests deterministic under load:
+/// the fixed sleeps they used to need were a guess about how long delivery and
+/// rendering would take on a busy machine.
 struct RunningInstance {
     /// The spawned child process.
     child: std::process::Child,
@@ -570,6 +861,10 @@ struct RunningInstance {
     _dir: tempfile::TempDir,
     /// Port the listener is bound to.
     port: u16,
+    /// Everything written to stdout so far.
+    stdout: Arc<Mutex<String>>,
+    /// The thread mirroring stdout, joined once the child has exited.
+    stdout_reader: Option<JoinHandle<()>>,
 }
 
 impl RunningInstance {
@@ -581,7 +876,7 @@ impl RunningInstance {
         let data_dir = dir.path().join("data");
         let port = free_port();
         let args = hermetic_args(cli, &config_path, &data_dir, port);
-        let child = Command::new(binary())
+        let mut child = Command::new(binary())
             .args(&args)
             .current_dir(dir.path())
             .stdin(Stdio::piped())
@@ -589,27 +884,128 @@ impl RunningInstance {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn instance");
+
+        // Rust's stdout is line-buffered even when it is a pipe, so a reader sees
+        // each rendered line as soon as the instance writes it.
+        let stdout = Arc::new(Mutex::new(String::new()));
+        let stdout_reader = child.stdout.take().map(|out| {
+            let sink = Arc::clone(&stdout);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(out);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    if let Ok(mut buffer) = sink.lock() {
+                        buffer.push_str(&line);
+                    }
+                    line.clear();
+                }
+            })
+        });
+
         Self {
             child,
             _dir: dir,
             port,
+            stdout,
+            stdout_reader,
+        }
+    }
+
+    /// Everything the instance has written to stdout so far.
+    fn written(&self) -> String {
+        self.stdout
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default()
+    }
+
+    /// Wait until `needle` appears on stdout.
+    ///
+    /// Returns whether it appeared within `timeout`.
+    fn wait_for(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.written().contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Wait until the instance exits on its own (for example after `/quit`).
+    ///
+    /// Returns its exit code, or `None` if it was still running when `timeout`
+    /// elapsed. Unlike [`RunningInstance::shutdown`], this does not kill the child,
+    /// so a test that asks the instance to leave can assert on the code a *graceful*
+    /// exit produces.
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<i32> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status.code();
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
     /// Kill the instance and return everything it wrote.
     fn shutdown(mut self) -> SessionOutcome {
         let _ = self.child.kill();
-        let output = self.child.wait_with_output().expect("collect output");
+        // `wait_with_output` takes the child by value, so destructure first:
+        // `_dir` stays bound to keep the private workspace alive until the child
+        // has been reaped.
+        let RunningInstance {
+            child,
+            _dir,
+            stdout,
+            stdout_reader,
+            ..
+        } = self;
+        let output = child.wait_with_output().expect("collect output");
+        // stdout was taken by the reader thread; join it so the mirror is complete
+        // before the buffer is read.
+        if let Some(reader) = stdout_reader {
+            let _ = reader.join();
+        }
+        let stdout = stdout
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default();
         SessionOutcome {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stdout,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             code: output.status.code(),
             timed_out: false,
         }
     }
+
+    /// Write one line to the instance's stdin.
+    ///
+    /// Used by tests that have to interleave input with real time (for example to
+    /// let a handshake finish before addressing a peer).
+    fn write_line(&mut self, line: &str) {
+        let stdin = self.child.stdin.as_mut().expect("stdin is piped");
+        writeln!(stdin, "{line}").expect("write to the instance");
+        stdin.flush().expect("flush");
+    }
 }
 
 /// Two `run` instances sharing a passphrase talk to each other over the wire
+///
+/// The client is kept resident and only addresses Alice once it has seen her
+/// connect, rather than running `/peers`, `/msg` and `/quit` as one script. A
+/// scripted client can execute `/msg` before the dial completes: the message is
+/// then buffered for a peer that is still *offline* to the client and is dropped
+/// when the script's `/quit` shuts the process down, which looked like "the
+/// message never arrived" but was the script racing the handshake, not a
+/// delivery regression. Waiting for the connection (and then for the line Alice
+/// prints) makes delivery, not script timing, the thing under test.
 #[test]
 fn test_two_run_instances_exchange_messages() {
     let passphrase = "repl-e2e-passphrase";
@@ -620,7 +1016,7 @@ fn test_two_run_instances_exchange_messages() {
     std::thread::sleep(Duration::from_millis(700));
 
     let peer = format!("127.0.0.1:{}", server.port);
-    let client_cli = vec![
+    let mut client = RunningInstance::spawn(&[
         "run",
         "--nick",
         "Bob",
@@ -628,25 +1024,60 @@ fn test_two_run_instances_exchange_messages() {
         passphrase,
         "--peer",
         peer.as_str(),
-    ];
-    let script = "/peers\n/msg Alice hello from the client\n/quit\n";
-    let (client, _client_dir) = run_session(&client_cli, script, Duration::from_secs(20));
+    ]);
 
-    assert_eq!(client.code, Some(0), "client failed: {}", client.stdout);
-    // The client sees the server's announced nickname...
-    assert_contains(&client.stdout, "1 peer(s) connected:", "client peers");
-    assert_contains(&client.stdout, "1. Alice", "client peer nickname");
-    // ...and its message is queued for exactly that peer.
+    // Let the dial and the nickname exchange complete. Waiting for the line the
+    // client prints when it learns Alice's nickname is deterministic where a
+    // fixed residence time would be a guess about how long the handshake takes
+    // on a loaded machine.
+    assert!(
+        client.wait_for("🔗 Alice connected", Duration::from_secs(20)),
+        "the client must learn the peer's nickname before addressing it (bob said: {})",
+        client.written()
+    );
+
+    client.write_line("/peers");
+    assert!(
+        client.wait_for("1 peer(s) connected:", Duration::from_secs(20)),
+        "the client must see the peer connect (bob said: {})",
+        client.written()
+    );
+    assert_contains(&client.written(), "1. Alice", "client peer nickname");
+
+    client.write_line("/msg Alice hello from the client");
+    // The client sees its message handed to the transport for exactly that peer.
+    assert!(
+        client.wait_for("📤 → Alice: hello from the client", Duration::from_secs(20)),
+        "client send (bob said: {})",
+        client.written()
+    );
+    assert_contains(&client.written(), "queued for 1 peer", "client send count");
+
+    // The server prints the frame once it has processed it; waiting for the line
+    // is deterministic where a fixed sleep was a guess.
+    assert!(
+        server.wait_for("📥 Bob: hello from the client", Duration::from_secs(10)),
+        "the server must receive the client's message (alice said: {})",
+        server.written()
+    );
+
+    // Only now does the client leave, and it must leave cleanly.
+    client.write_line("/quit");
+    let code = client.wait_for_exit(Duration::from_secs(10));
+    let client_out = client.shutdown();
+    let server_out = server.shutdown();
+
+    assert_eq!(
+        code,
+        Some(0),
+        "the client must quit cleanly (bob said: {})",
+        client_out.combined()
+    );
     assert_contains(
-        &client.stdout,
+        &client_out.stdout,
         "📤 → Alice: hello from the client",
         "client send",
     );
-    assert_contains(&client.stdout, "queued for 1 peer", "client send count");
-
-    // Let the server process the inbound frame before it is killed.
-    std::thread::sleep(Duration::from_millis(500));
-    let server_out = server.shutdown();
     assert_contains(
         &server_out.stdout,
         "📥 Bob: hello from the client",

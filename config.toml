@@ -15,29 +15,58 @@ bootstrap_nodes = [
     'tox.instinctive.ch:33445',
     'tox.instinctive.ch:3389',
 ]
+# One knob, two deadlines: how long a single outbound dial may take, and how long a
+# peer that has connected has to announce itself before its connection slot is
+# reclaimed (a silent socket must not hold a slot forever).
 connection_timeout = 30
 max_connections = 100
-enable_upnp = true
+# How often an empty keepalive frame is sent to a greeted peer, in seconds. The default
+# (20) is also the maximum this may be: probing *faster* keeps a NAT mapping alive that
+# would otherwise expire, but probing *slower* would let a peer enforcing the default
+# idle deadline (three default cadences, so 60 s) drop this instance for silence.
+keepalive_interval = 20
+# UPnP port mapping is not implemented (no mapping client is linked), so asking
+# for it is rejected rather than silently ignored. Leave this false.
+enable_upnp = false
 enable_ipv6 = true
 
 [database]
 database_type = 'sqlite'
 connection_string = 'meta_text.db'
 max_connections = 10
+# Apply the schema when the store is opened. `false` means "somebody else manages the
+# schema": the store is then checked at startup and refused unless both tables and every
+# column this build writes to are already there, rather than failing one write at a time.
 enable_migrations = true
 
 [crypto]
 enable_encryption = true
 algorithm = 'ChaCha20-Poly1305'
 kdf = 'Argon2'
-key_rotation_days = 30
+# No rotation is implemented, and none can be: the session key is shared with every peer
+# that has the passphrase and the identity key is what peers pin, so a local timer would
+# leave them unable to read what this instance writes. `0` is the only accepted value.
+key_rotation_days = 0
+# The per-connection key agreement is part of the identity handshake, not a switch, so
+# there is no downgrade path a `false` could select; `false` is refused at startup.
 enable_pfs = true
 
 [ui]
+# The full screen interface. `dark` and `light` are the themes it can draw; another
+# name is refused at startup rather than silently ignored.
 theme = 'dark'
+# Draw with colours. With `false` every style is the terminal's own, which is what a
+# pipe, a screen reader or a monochrome terminal needs.
 enable_colors = true
+# Capture the mouse so its wheel scrolls the conversation pane. The capture also
+# takes over text selection, which most terminals restore with a modifier.
 enable_mouse = true
+# Not implemented: message lines are rendered by the presentation layer, which adds
+# the direction, the peer and the delivery report around the body. Any other value is
+# refused at startup instead of being accepted and ignored.
 message_format = '[{time}] {sender}: {message}'
+# Follow new output. With `false` the pane keeps showing the rows it is showing while
+# output arrives, and its title says so until PgDn returns to the newest row.
 auto_scroll = true
 
 [logging]
@@ -45,5 +74,15 @@ level = 'info'
 file_path = 'logs/meta-text.log'
 enable_console = true
 enable_file = true
+# Rotation is by size *and* by day: logs/meta-text.log.2026-09-14 is the day's
+# first file, .001/.002 continue it once it reaches rotation_size_mb.
 rotation_size_mb = 10
+# Files kept in total, the active one included; the oldest are removed first.
 max_files = 5
+
+# Core protocol endpoint policy. The endpoint itself is started with
+# --ipc-listen; these are the limits it enforces, per client *address* (so a
+# client cannot reset its allowance by reconnecting).
+[ipc]
+requests_per_second = 256   # 0 disables the rate limit
+request_burst = 512
