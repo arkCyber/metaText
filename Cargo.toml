@@ -62,7 +62,7 @@ clap = { version = "4.0", features = ["derive", "env"] }
 # build compiles no SQLx driver at all. Enabling one here only forwards it to the
 # layer that uses it; enabling postgres/mysql would additionally force all three
 # drivers to be compiled unconditionally.
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls"] }
 
 # Cryptography
 argon2 = "0.5"
